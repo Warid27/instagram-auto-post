@@ -193,94 +193,129 @@ export async function getPostStats(page, postUrl) {
         commentsCount: 0
       }
       
-      // Get likes count
-      // Instagram shows likes in various ways
-      const likeSelectors = [
-        'section span[aria-label*="like"]',
-        'section button span',
-        'section a[href*="/liked_by/"] span',
-        'article section span'
-      ]
-      
-      for (const selector of likeSelectors) {
-        const elements = Array.from(document.querySelectorAll(selector))
-        for (const el of elements) {
-          const text = el.textContent || ''
-          const ariaLabel = el.getAttribute('aria-label') || ''
-          
-          // Check if it's a like count
-          if (ariaLabel.includes('like') || text.match(/^[\d,KMkm]+$/)) {
-            const match = text.match(/[\d,KMkm]+/)
-            if (match) {
-              result.likesCount = match[0]
-              break
+      // Try to get from JSON-LD or script tags first (most reliable)
+      const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+      for (const script of scripts) {
+        try {
+          const data = JSON.parse(script.textContent)
+          if (data.interactionStatistic) {
+            for (const stat of data.interactionStatistic) {
+              if (stat.interactionType === 'https://schema.org/LikeAction') {
+                result.likesCount = stat.userInteractionCount || 0
+              } else if (stat.interactionType === 'https://schema.org/CommentAction') {
+                result.commentsCount = stat.userInteractionCount || 0
+              }
             }
           }
+        } catch (e) {
+          // Ignore JSON parse errors
         }
-        if (result.likesCount) break
       }
       
-      // Get views count (for videos)
-      const viewSelectors = [
-        'section span[aria-label*="view"]',
-        'section span:contains("views")'
-      ]
-      
-      for (const selector of viewSelectors) {
-        const elements = Array.from(document.querySelectorAll(selector))
-        for (const el of elements) {
-          const text = el.textContent || ''
-          if (text.toLowerCase().includes('view')) {
-            const match = text.match(/[\d,KMkm]+/)
-            if (match) {
-              result.viewsCount = match[0]
-              break
-            }
-          }
-        }
-        if (result.viewsCount) break
-      }
-      
-      // Get comments count
-      const commentSelectors = [
-        'section span[aria-label*="comment"]',
-        'section a[href*="/comments/"] span',
-        'section button[aria-label*="comment"] span'
-      ]
-      
-      for (const selector of commentSelectors) {
-        const elements = Array.from(document.querySelectorAll(selector))
-        for (const el of elements) {
-          const text = el.textContent || ''
-          const ariaLabel = el.getAttribute('aria-label') || ''
-          
-          if (ariaLabel.includes('comment') || text.match(/^[\d,KMkm]+$/)) {
-            const match = text.match(/[\d,KMkm]+/)
-            if (match) {
-              result.commentsCount = match[0]
-              break
-            }
-          }
-        }
-        if (result.commentsCount) break
-      }
-      
-      // Fallback: Try to extract from page source
-      if (!result.likesCount || !result.commentsCount) {
-        const pageText = document.body.textContent || ''
+      // Try to find in article section (main post content)
+      const article = document.querySelector('article')
+      if (article) {
+        const articleText = article.textContent || ''
         
-        // Look for patterns like "1,234 likes" or "1.2K likes"
-        const likesMatch = pageText.match(/([\d,KMkm.]+)\s*likes?/i)
+        // Look for likes - usually appears as "1,234 likes" or "1.2K likes"
+        const likesMatch = articleText.match(/([\d,KMkm.]+)\s*likes?/i)
         if (likesMatch && !result.likesCount) {
           result.likesCount = likesMatch[1]
         }
         
-        const commentsMatch = pageText.match(/([\d,KMkm.]+)\s*comments?/i)
+        // Look for comments
+        const commentsMatch = articleText.match(/([\d,KMkm.]+)\s*comments?/i)
         if (commentsMatch && !result.commentsCount) {
           result.commentsCount = commentsMatch[1]
         }
         
-        const viewsMatch = pageText.match(/([\d,KMkm.]+)\s*views?/i)
+        // Look for views (videos)
+        const viewsMatch = articleText.match(/([\d,KMkm.]+)\s*views?/i)
+        if (viewsMatch && !result.viewsCount) {
+          result.viewsCount = viewsMatch[1]
+        }
+      }
+      
+      // Try aria-labels for accessibility
+      const allElements = Array.from(document.querySelectorAll('[aria-label]'))
+      for (const el of allElements) {
+        const ariaLabel = el.getAttribute('aria-label') || ''
+        const text = el.textContent || ''
+        
+        // Likes
+        if (ariaLabel.toLowerCase().includes('like') && !result.likesCount) {
+          const match = text.match(/[\d,KMkm.]+/) || ariaLabel.match(/[\d,KMkm.]+/)
+          if (match) {
+            result.likesCount = match[0]
+          }
+        }
+        
+        // Comments
+        if (ariaLabel.toLowerCase().includes('comment') && !result.commentsCount) {
+          const match = text.match(/[\d,KMkm.]+/) || ariaLabel.match(/[\d,KMkm.]+/)
+          if (match) {
+            result.commentsCount = match[0]
+          }
+        }
+        
+        // Views
+        if (ariaLabel.toLowerCase().includes('view') && !result.viewsCount) {
+          const match = text.match(/[\d,KMkm.]+/) || ariaLabel.match(/[\d,KMkm.]+/)
+          if (match) {
+            result.viewsCount = match[0]
+          }
+        }
+      }
+      
+      // Try specific selectors for likes button
+      const likeButtons = Array.from(document.querySelectorAll('button, span, a')).filter(el => {
+        const text = el.textContent || ''
+        const aria = el.getAttribute('aria-label') || ''
+        return (text.includes('like') || aria.includes('like')) && /[\d,KMkm]/.test(text)
+      })
+      
+      if (likeButtons.length > 0 && !result.likesCount) {
+        const likeText = likeButtons[0].textContent || ''
+        const match = likeText.match(/[\d,KMkm.]+/)
+        if (match) {
+          result.likesCount = match[0]
+        }
+      }
+      
+      // Try specific selectors for comments
+      const commentButtons = Array.from(document.querySelectorAll('button, span, a')).filter(el => {
+        const text = el.textContent || ''
+        const aria = el.getAttribute('aria-label') || ''
+        return (text.includes('comment') || aria.includes('comment')) && /[\d,KMkm]/.test(text)
+      })
+      
+      if (commentButtons.length > 0 && !result.commentsCount) {
+        const commentText = commentButtons[0].textContent || ''
+        const match = commentText.match(/[\d,KMkm.]+/)
+        if (match) {
+          result.commentsCount = match[0]
+        }
+      }
+      
+      // Final fallback: search entire page text
+      if (!result.likesCount || !result.commentsCount) {
+        const pageText = document.body.textContent || ''
+        
+        // More specific patterns
+        const likesPattern = /([\d,KMkm.]+)\s*(?:other\s+)?(?:people\s+)?likes?/i
+        const likesMatch = pageText.match(likesPattern)
+        if (likesMatch && !result.likesCount) {
+          result.likesCount = likesMatch[1]
+        }
+        
+        const commentsPattern = /([\d,KMkm.]+)\s*(?:other\s+)?(?:people\s+)?comments?/i
+        const commentsMatch = pageText.match(commentsPattern)
+        if (commentsMatch && !result.commentsCount) {
+          result.commentsCount = commentsMatch[1]
+        }
+        
+        const viewsPattern = /([\d,KMkm.]+)\s*views?/i
+        const viewsMatch = pageText.match(viewsPattern)
         if (viewsMatch && !result.viewsCount) {
           result.viewsCount = viewsMatch[1]
         }

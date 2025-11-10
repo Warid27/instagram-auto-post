@@ -92,13 +92,13 @@ const Reviews = () => {
 
       if (error) throw new Error(error)
 
-      toast.success('Success', `Review started for ${data.accountCount} account(s)`)
+      toast.success('Success', `Review started for ${data.accountCount} account(s). Check Bot Status page for progress.`)
       setSelectedAccounts([])
 
       // Refresh reviews after a delay
       setTimeout(() => {
         fetchReviews()
-      }, 5000)
+      }, 10000) // Wait longer for review to complete
     } catch (error) {
       console.error('Error starting review:', error)
       toast.error('Error', error.message || 'Failed to start review')
@@ -174,7 +174,8 @@ const Reviews = () => {
         <CardContent className="p-6">
           <h2 className="text-xl font-semibold mb-4">Start New Review</h2>
           <p className="text-gray-600 mb-4">
-            Select accounts to review. The bot will collect account stats and post analytics.
+            Select accounts to review. The review bot will run on the server and collect account stats and post analytics.
+            You can view the progress in the Bot Status page.
           </p>
 
           {accounts.length === 0 ? (
@@ -184,6 +185,24 @@ const Reviews = () => {
             </div>
           ) : (
             <>
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-sm text-gray-600">
+                  {selectedAccounts.length} of {accounts.length} selected
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    if (selectedAccounts.length === accounts.length) {
+                      setSelectedAccounts([])
+                    } else {
+                      setSelectedAccounts(accounts.map((acc) => acc.id))
+                    }
+                  }}
+                >
+                  {selectedAccounts.length === accounts.length ? 'Deselect All' : 'Select All'}
+                </Button>
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
                 {accounts.map((account) => (
                   <button

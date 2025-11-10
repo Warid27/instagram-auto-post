@@ -57,6 +57,21 @@ function log(level, message, meta = {}) {
   }
 }
 
+async function logActivity(type, message, details = '', userId = null) {
+  log(type, message, { details })
+  try {
+    const logEntry = {
+      action: message,
+      status: type,
+      details: typeof details === 'string' ? { details } : details,
+    }
+    if (userId) {
+      logEntry.user_id = userId
+    }
+    await supabase.from('bot_logs').insert(logEntry)
+  } catch {}
+}
+
 /**
  * Review a single account
  * @param {string} accountId - Account ID to review
@@ -69,6 +84,7 @@ export async function reviewAccountById(accountId, userId) {
 
   try {
     log('info', `Starting review for account ${accountId}`, { accountId, userId })
+    await logActivity('info', `Review started for account ${accountId}`, { accountId }, userId)
 
     // Fetch account details
     const { data: account, error: accountError } = await supabase
@@ -81,6 +97,11 @@ export async function reviewAccountById(accountId, userId) {
     if (accountError || !account) {
       throw new Error(`Account not found or access denied: ${accountError?.message || 'Unknown error'}`)
     }
+
+    await logActivity('info', `Logging in to Instagram for @${account.instagram_username}`, {
+      accountId,
+      username: account.instagram_username,
+    }, userId)
 
     // Launch browser
     browser = await puppeteer.launch({
@@ -99,11 +120,21 @@ export async function reviewAccountById(accountId, userId) {
 
     // Perform review
     log('info', `Reviewing account @${account.instagram_username}`)
+    await logActivity('info', `Collecting account stats for @${account.instagram_username}`, {
+      accountId,
+      username: account.instagram_username,
+    }, userId)
     const reviewResult = await reviewAccount(page, account)
 
     if (!reviewResult.success) {
       throw new Error(reviewResult.error || 'Review failed')
     }
+
+    await logActivity('info', `Account stats collected for @${account.instagram_username}`, {
+      accountId,
+      username: account.instagram_username,
+      stats: reviewResult.accountStats,
+    }, userId)
 
     // Create review record in database
     const reviewDatetime = new Date().toISOString()
@@ -128,6 +159,12 @@ export async function reviewAccountById(accountId, userId) {
 
     // Save post stats
     if (reviewResult.posts && reviewResult.posts.length > 0) {
+      await logActivity('info', `Collecting post stats: ${reviewResult.posts.length} posts`, {
+        accountId,
+        reviewId,
+        postCount: reviewResult.posts.length,
+      }, userId)
+
       const postRecords = reviewResult.posts.map((post) => ({
         review_id: reviewId,
         post_url: post.url,
@@ -142,8 +179,23 @@ export async function reviewAccountById(accountId, userId) {
 
       if (postsError) {
         log('warn', `Failed to save some post stats: ${postsError.message}`, { reviewId })
+        await logActivity('warning', `Failed to save post stats: ${postsError.message}`, {
+          accountId,
+          reviewId,
+        }, userId)
         // Don't fail the whole review if post stats fail
+      } else {
+        await logActivity('success', `Post stats saved: ${reviewResult.posts.length} posts`, {
+          accountId,
+          reviewId,
+          postCount: reviewResult.posts.length,
+        }, userId)
       }
+    } else {
+      await logActivity('warning', `No posts found for @${account.instagram_username}`, {
+        accountId,
+        reviewId,
+      }, userId)
     }
 
     log('info', `Review completed successfully for @${account.instagram_username}`, {
@@ -151,6 +203,14 @@ export async function reviewAccountById(accountId, userId) {
       accountId,
       postsCount: reviewResult.posts?.length || 0,
     })
+
+    await logActivity('success', `Review completed for @${account.instagram_username}`, {
+      accountId,
+      reviewId,
+      username: account.instagram_username,
+      postsCount: reviewResult.posts?.length || 0,
+      stats: reviewResult.accountStats,
+    }, userId)
 
     await browser.close()
 
@@ -166,6 +226,11 @@ export async function reviewAccountById(accountId, userId) {
       accountId,
       userId,
     })
+
+    await logActivity('error', `Review failed: ${error.message}`, {
+      accountId,
+      error: error.message,
+    }, userId)
 
     if (browser) {
       try {

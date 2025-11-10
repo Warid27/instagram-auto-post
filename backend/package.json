@@ -10,6 +10,7 @@
     "migrate": "node scripts/migrate.js",
     "migrate:dashboard": "node scripts/migrate-dashboard.js",
     "migrate:002": "node scripts/run-migration-002.js",
+    "migrate:003": "node scripts/run-migration-003.js",
     "fix-env": "node scripts/fix-env.js"
   },
   "dependencies": {
