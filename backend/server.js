@@ -13,6 +13,7 @@ import postsRouter from './routes/posts.js';
 import queueRouter from './routes/queue.js';
 import uploadRouter from './routes/upload.js';
 import botRouter from './routes/bot.js';
+import reviewerRouter from './routes/reviewer.js';
 
 // Load environment variables
 dotenv.config();
@@ -108,6 +109,11 @@ app.get('/api', (req, res) => {
         status: '/api/bot/status',
         logs: '/api/bot/logs',
       },
+      reviewer: {
+        review: '/api/reviewer/review',
+        reviews: '/api/reviewer/reviews',
+        compare: '/api/reviewer/compare/:accountId',
+      },
     },
   });
 });
@@ -118,6 +124,7 @@ app.use('/api/posts', postsRouter);
 app.use('/api/queue', queueRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/bot', botRouter);
+app.use('/api/reviewer', reviewerRouter);
 
 // 404 handler
 app.use((req, res) => {

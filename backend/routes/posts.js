@@ -3,6 +3,7 @@ import { body, param, query, validationResult } from 'express-validator';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import { authenticateUser } from '../middleware/auth.js';
+import { logActivity } from '../utils/activityLogger.js';
 
 dotenv.config();
 
@@ -301,6 +302,15 @@ router.post(
     if (fetchError) {
       console.error('Supabase error:', fetchError);
     }
+
+    // Log post creation
+    const accountUsernames = userAccounts.map(acc => acc.instagram_username).join(', ');
+    await logActivity(userId, `Post created for ${account_ids.length} account(s)`, 'info', {
+      postId: post.id,
+      accountIds: account_ids,
+      accountUsernames,
+      scheduledAt: scheduled_at || new Date().toISOString(),
+    });
 
     res.status(201).json({
       message: 'Post created successfully',

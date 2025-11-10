@@ -7,6 +7,7 @@ import {
   List, 
   Settings, 
   Activity,
+  BarChart3,
   Menu, 
   X,
   LogOut,
@@ -27,6 +28,7 @@ const Layout = ({ children }) => {
     { name: 'Create', href: '/create', icon: PlusCircle },
     { name: 'Queue', href: '/queue', icon: List },
     { name: 'Bot Status', href: '/bot-status', icon: Activity },
+    { name: 'Reviews', href: '/reviews', icon: BarChart3 },
     { name: 'Settings', href: '/settings', icon: Settings },
   ]
 

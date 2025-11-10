@@ -70,10 +70,18 @@ function log(level, message, meta = {}) {
   }
 }
 
-async function logActivity(type, message, details = '') {
+async function logActivity(type, message, details = '', userId = null) {
   log(type, message, { details })
   try {
-    await supabase.from('bot_logs').insert({ action: message, status: type, details: { details } })
+    const logEntry = {
+      action: message,
+      status: type,
+      details: typeof details === 'string' ? { details } : details,
+    }
+    if (userId) {
+      logEntry.user_id = userId
+    }
+    await supabase.from('bot_logs').insert(logEntry)
   } catch {}
 }
 
@@ -182,6 +190,7 @@ async function postToInstagram(page, post, account) {
       {
         navigationTimeoutMs: CONFIG.pageLoadTimeout,
         processingWaitMs: 10000,
+        username: account.instagram_username,
       }
     )
     
@@ -256,7 +265,7 @@ async function processPost(browser, post) {
             .update({ posts_today: postsToday + 1 })
             .eq('id', account.id)
 
-          await logActivity('success', `Posted to @${account.instagram_username}`, `URL: ${postedUrl || 'N/A'}`)
+          await logActivity('success', `Posted to @${account.instagram_username}`, { url: postedUrl || 'N/A', postId: post.id, accountId: account.id }, post.user_id)
         } else {
           throw new Error(res.error || 'Unknown failure while posting')
         }
@@ -268,7 +277,15 @@ async function processPost(browser, post) {
         if (/net::|ECONN|ETIMEDOUT|network/i.test(msg)) category = 'network'
         else if (/instagram|csrf|login|2fa/i.test(msg)) category = 'instagram'
         log('error', `Error posting to @${account.instagram_username}`, { error: msg, category })
-        try { await supabase.from('bot_logs').insert({ action: 'post', status: 'error', details: { postId: post.id, accountId: account.id, category }, error: msg }) } catch {}
+        try { 
+          await supabase.from('bot_logs').insert({ 
+            user_id: post.user_id,
+            action: 'post', 
+            status: 'error', 
+            details: { postId: post.id, accountId: account.id, category }, 
+            error: msg 
+          }) 
+        } catch {}
 
         // update post_accounts row to failed for this attempt
         await supabase
@@ -329,7 +346,19 @@ export async function runBot() {
     const queue = await fetchQueue(5)
     if (!queue || queue.length === 0) {
       log('info', 'No pending posts in queue')
+      // Log queue check for all users (we don't know which user to log for)
+      // This is a general system log, so we'll skip user_id
       return
+    }
+
+    // Log queue check - group by user_id
+    const usersInQueue = [...new Set(queue.map(p => p.user_id).filter(Boolean))]
+    for (const userId of usersInQueue) {
+      const userPosts = queue.filter(p => p.user_id === userId)
+      await logActivity('info', `Queue check: ${userPosts.length} post(s) found`, {
+        postCount: userPosts.length,
+        postIds: userPosts.map(p => p.id),
+      }, userId)
     }
 
     // Launch browser

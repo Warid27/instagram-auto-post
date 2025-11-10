@@ -124,45 +124,53 @@ const BotStatus = () => {
         setLastActivity(latest.created_at)
       }
 
-      // Generate activity log from recent posts
-      const recentActivities = []
-      const recentPosts = posts
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-        .slice(0, 20)
+      // Fetch activity logs from backend API
+      try {
+        const { data: logsData, error: logsError } = await api.get('/bot/logs', {
+          params: { limit: 50 }
+        })
 
-      recentPosts.forEach(post => {
-        if (post.status === 'completed') {
-          recentActivities.push({
-            type: 'success',
-            message: `Post completed successfully`,
-            timestamp: post.created_at,
-            details: `Post ID: ${post.id.substring(0, 8)}...`,
+        if (!logsError && logsData?.logs) {
+          setActivities(logsData.logs)
+        } else {
+          // Fallback: Generate activity log from recent posts if API fails
+          const recentActivities = []
+          const recentPosts = posts
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+            .slice(0, 20)
+
+          recentPosts.forEach(post => {
+            if (post.status === 'completed') {
+              recentActivities.push({
+                type: 'success',
+                message: `Post completed successfully`,
+                timestamp: post.created_at,
+                details: `Post ID: ${post.id.substring(0, 8)}...`,
+              })
+            } else if (post.status === 'failed') {
+              recentActivities.push({
+                type: 'error',
+                message: `Post failed`,
+                timestamp: post.created_at,
+                details: `Post ID: ${post.id.substring(0, 8)}...`,
+              })
+            } else if (post.status === 'processing') {
+              recentActivities.push({
+                type: 'info',
+                message: `Post processing`,
+                timestamp: post.created_at,
+                details: `Post ID: ${post.id.substring(0, 8)}...`,
+              })
+            }
           })
-        } else if (post.status === 'failed') {
-          recentActivities.push({
-            type: 'error',
-            message: `Post failed`,
-            timestamp: post.created_at,
-            details: `Post ID: ${post.id.substring(0, 8)}...`,
-          })
-        } else if (post.status === 'processing') {
-          recentActivities.push({
-            type: 'info',
-            message: `Post processing`,
-            timestamp: post.created_at,
-            details: `Post ID: ${post.id.substring(0, 8)}...`,
-          })
+
+          setActivities(recentActivities.slice(0, 20))
         }
-      })
-
-      // Add queue check activity
-      recentActivities.push({
-        type: 'info',
-        message: 'Queue check completed',
-        timestamp: new Date().toISOString(),
-      })
-
-      setActivities(recentActivities.slice(0, 20))
+      } catch (logsErr) {
+        console.error('Error fetching logs:', logsErr)
+        // Use empty array on error
+        setActivities([])
+      }
 
     } catch (error) {
       console.error('Error fetching bot status:', error)

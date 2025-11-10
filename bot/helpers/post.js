@@ -288,37 +288,273 @@ export async function postToInstagram(page, imageUrl, caption, options = {}) {
     log('info', 'Clicking Share')
     const shareBtn = await waitForElementBySelectorsOrText(page, selectors.shareButton, ['Share'], 20000)
     await clickWithRandomOffset(page, shareBtn)
-    await sleep(randomDelay(3000, 6000))
+    
+    // Wait longer for post to actually process
+    await sleep(randomDelay(5000, 8000))
+
+    // Check for error messages first
+    let hasError = false
+    try {
+      const errorIndicators = await page.evaluate(() => {
+        const errorTexts = ['error', 'failed', 'try again', 'something went wrong', 'couldn\'t share']
+        const allText = document.body.innerText.toLowerCase()
+        return errorTexts.some(text => allText.includes(text))
+      })
+      if (errorIndicators) {
+        log('warn', 'Error indicators found after sharing')
+        hasError = true
+      }
+    } catch {}
 
     // Wait for success indicator or dialog to close
+    let successConfirmed = false
     let postUrl = null
+    
     try {
+      // Wait for success toast or navigation away from create page
       await Promise.race([
-        (async () => { await waitForAnySelector(page, selectors.successToast, 20000) })(),
-        sleep(processingWaitMs),
+        (async () => {
+          try {
+            await waitForAnySelector(page, selectors.successToast, 15000)
+            successConfirmed = true
+          } catch {}
+        })(),
+        (async () => {
+          // Check if we navigated away from create page (indicates success)
+          await sleep(8000)
+          const currentUrl = page.url()
+          if (!currentUrl.includes('/create/')) {
+            successConfirmed = true
+          }
+        })(),
+        sleep(15000), // Max wait time
       ])
     } catch {}
 
     await screenshotStep(page, '07-shared')
 
-    // Try to discover a recent post URL visible in DOM
+    // Try to discover the post URL
+    // Strategy: 
+    // 1. Check if Instagram redirected us to the new post URL
+    // 2. If not, navigate to the user's profile and get the first post
     try {
-      const href = await page.evaluate(() => {
-        const anchors = Array.from(document.querySelectorAll('a'))
-        const postLink = anchors.find(a => a.href && a.href.includes('/p/'))
-        return postLink ? postLink.href : null
-      })
-      if (href) postUrl = href
-    } catch {}
+      // First, check if we're already on a post URL (Instagram sometimes redirects after sharing)
+      const currentUrl = page.url()
+      if (currentUrl.includes('/p/')) {
+        // Extract the post URL
+        const match = currentUrl.match(/https?:\/\/www\.instagram\.com\/p\/[^\/]+/)
+        if (match) {
+          postUrl = match[0] + '/'
+          log('info', 'Found post URL from redirect', { postUrl })
+        }
+      }
+      
+      // If we don't have a post URL yet, navigate to the user's profile
+      if (!postUrl && options.username) {
+        log('info', 'Navigating to user profile to find new post', { username: options.username })
+        try {
+          await page.goto(`https://www.instagram.com/${options.username}/`, { 
+            waitUntil: 'networkidle2', 
+            timeout: navTimeout 
+          })
+          await sleep(randomDelay(2000, 3000))
+          
+          // Get the first post from the profile grid (should be the newly created one)
+          const profilePostUrl = await page.evaluate(() => {
+            // Look for post links in the profile grid
+            const postLinks = Array.from(document.querySelectorAll('a[href*="/p/"]'))
+            // Filter to only get links that are actual post links (not in navigation, etc.)
+            const gridPosts = postLinks.filter(link => {
+              const href = link.getAttribute('href')
+              // Profile grid posts are typically in article or div containers
+              const parent = link.closest('article, div[role="button"]')
+              return parent && href && href.startsWith('/p/')
+            })
+            
+            if (gridPosts.length > 0) {
+              const href = gridPosts[0].getAttribute('href')
+              // Make sure it's a full URL
+              if (href.startsWith('/')) {
+                return 'https://www.instagram.com' + href
+              }
+              return href
+            }
+            return null
+          })
+          
+          if (profilePostUrl) {
+            postUrl = profilePostUrl
+            log('info', 'Found post URL from profile', { postUrl })
+          }
+        } catch (profileErr) {
+          log('warn', 'Failed to get post URL from profile', { error: profileErr.message })
+        }
+      }
+      
+      // Fallback: if we still don't have a URL, try the old method (but log a warning)
+      if (!postUrl) {
+        log('warn', 'Using fallback method to find post URL - may not be accurate')
+        const href = await page.evaluate(() => {
+          const anchors = Array.from(document.querySelectorAll('a[href*="/p/"]'))
+          if (anchors.length > 0) {
+            return anchors[0].href
+          }
+          return null
+        })
+        if (href) {
+          postUrl = href
+        }
+      }
+      
+      // Verify the URL is valid
+      if (postUrl && !postUrl.includes('/p/')) {
+        log('warn', 'Invalid post URL format', { postUrl })
+        postUrl = null
+      }
+    } catch (err) {
+      log('warn', 'Error discovering post URL', { error: err.message })
+    }
+
+    // Additional verification: Try to navigate to the post URL to verify it exists
+    let verified = false
+    if (postUrl && !hasError) {
+      try {
+        log('info', 'Verifying post URL exists', { postUrl })
+        // Try to navigate to the post URL - if it loads successfully, post exists
+        const response = await page.goto(postUrl, { waitUntil: 'networkidle2', timeout: 20000 })
+        await sleep(randomDelay(2000, 3000))
+        
+        // Check if page loaded successfully and is a valid post page
+        const postCheck = await page.evaluate((expectedUsername) => {
+          // Check for common post page indicators
+          const hasPostContent = document.querySelector('article') || 
+                                 document.querySelector('[role="main"]') ||
+                                 document.body.innerText.includes('Like') ||
+                                 document.body.innerText.includes('Comment')
+          
+          if (!hasPostContent || document.body.innerText.toLowerCase().includes('sorry, this page')) {
+            return { isValid: false, username: null }
+          }
+          
+          // Try to extract the username from the post page
+          // The username is typically in a link in the post header
+          let foundUsername = null
+          
+          // Look for username link in the post header/article
+          const article = document.querySelector('article')
+          if (article) {
+            const headerLinks = article.querySelectorAll('header a[href^="/"]')
+            for (const link of headerLinks) {
+              const href = link.getAttribute('href')
+              if (href) {
+                const match = href.match(/^\/([^\/\?]+)/)
+                if (match && match[1] && 
+                    match[1] !== 'p' && 
+                    match[1] !== 'accounts' && 
+                    match[1] !== 'direct' && 
+                    match[1] !== 'stories' &&
+                    match[1] !== 'explore' &&
+                    match[1] !== 'reels') {
+                  foundUsername = match[1]
+                  break
+                }
+              }
+            }
+          }
+          
+          // Fallback: look for any username link in the main content
+          if (!foundUsername) {
+            const usernameLinks = Array.from(document.querySelectorAll('a[href^="/"]'))
+            for (const link of usernameLinks) {
+              const href = link.getAttribute('href')
+              if (href) {
+                const match = href.match(/^\/([^\/\?]+)/)
+                if (match && match[1] && 
+                    match[1] !== 'p' && 
+                    match[1] !== 'accounts' && 
+                    match[1] !== 'direct' && 
+                    match[1] !== 'stories' &&
+                    match[1] !== 'explore' &&
+                    match[1] !== 'reels' &&
+                    !match[1].includes('.')) {
+                  // Check if this looks like a username (not a path)
+                  foundUsername = match[1]
+                  break
+                }
+              }
+            }
+          }
+          
+          return { 
+            isValid: true, 
+            username: foundUsername,
+            matchesExpected: expectedUsername ? foundUsername === expectedUsername : null
+          }
+        }, options.username || null)
+
+        if (postCheck.isValid && response && response.status() < 400) {
+          // If we have a username, verify it matches
+          if (options.username && postCheck.username) {
+            if (postCheck.matchesExpected) {
+              verified = true
+              log('info', 'Post URL verified - post exists and belongs to correct account', { 
+                postUrl, 
+                username: postCheck.username 
+              })
+            } else {
+              log('warn', 'Post URL belongs to different account', { 
+                postUrl, 
+                expected: options.username, 
+                found: postCheck.username 
+              })
+              // Don't verify if it's the wrong account
+              verified = false
+            }
+          } else {
+            // If we can't verify username, just check if post is valid
+            verified = true
+            log('info', 'Post URL verified - post exists', { postUrl })
+          }
+        } else {
+          log('warn', 'Post URL verification failed - post may not exist', { postUrl, status: response?.status() })
+        }
+      } catch (verifyErr) {
+        log('warn', 'Could not verify post URL', { error: verifyErr.message, postUrl })
+        // Don't fail if verification fails - might be timing issue or network problem
+      }
+    }
 
     // 7) Cleanup and finish
     try {
       if (localPath && fs.existsSync(localPath)) fs.unlinkSync(localPath)
     } catch {}
 
+    // Determine success based on multiple factors
+    // Require: no errors AND (verified post OR (success confirmed AND postUrl found))
+    // This ensures we don't report success just because we found a random post URL
+    const actuallySucceeded = !hasError && (
+      verified || // Post URL verified to exist
+      (successConfirmed && postUrl) || // Success confirmed AND we have a post URL
+      (successConfirmed && !postUrl) // Success confirmed even without URL (might be timing)
+    )
+    
+    if (!actuallySucceeded) {
+      log('warn', 'Post may not have succeeded - no clear confirmation', {
+        hasError,
+        successConfirmed,
+        verified,
+        postUrl: postUrl || 'none'
+      })
+      return {
+        success: false,
+        error: 'Post completion not confirmed - no success indicator or verified post URL found',
+        retryAfterMs: 0,
+      }
+    }
+
     await sleep(randomDelay(2000, 5000))
 
-    log('info', 'Post flow completed', { postUrl: postUrl || 'unknown' })
+    log('info', 'Post flow completed', { postUrl: postUrl || 'unknown', verified })
     return { success: true, url: postUrl || null }
   } catch (error) {
     log('error', 'Post flow failed', { error: error.message })

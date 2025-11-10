@@ -6,13 +6,11 @@ import ProtectedRoute from './components/ProtectedRoute'
 import Login from './pages/Login'
 import Signup from './pages/Signup'
 import Dashboard from './pages/Dashboard'
-import Accounts from './pages/Accounts'
 import AccountManager from './pages/AccountManager'
-import Create from './pages/Create'
 import CreatePost from './pages/CreatePost'
-import Queue from './pages/Queue'
 import PostQueue from './pages/PostQueue'
 import BotStatus from './pages/BotStatus'
+import Reviews from './pages/Reviews'
 import Settings from './pages/Settings'
 
 function App() {
@@ -79,6 +77,16 @@ function App() {
               <ProtectedRoute>
                 <Layout>
                   <BotStatus />
+                </Layout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/reviews"
+            element={
+              <ProtectedRoute>
+                <Layout>
+                  <Reviews />
                 </Layout>
               </ProtectedRoute>
             }

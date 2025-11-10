@@ -9,6 +9,7 @@
     "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js",
     "migrate": "node scripts/migrate.js",
     "migrate:dashboard": "node scripts/migrate-dashboard.js",
+    "migrate:002": "node scripts/run-migration-002.js",
     "fix-env": "node scripts/fix-env.js"
   },
   "dependencies": {

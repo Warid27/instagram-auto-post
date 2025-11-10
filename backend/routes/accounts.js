@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import { authenticateUser } from '../middleware/auth.js';
 import { encryptPassword, decryptPassword } from '../utils/encryption.js';
+import { logActivity } from '../utils/activityLogger.js';
 
 dotenv.config();
 
@@ -186,8 +187,17 @@ router.post(
     try {
       const { loginAccount } = await import('../services/instagram-login.js');
       await loginAccount(data.id, normalizedUsername, password);
+      await logActivity(userId, `Account created and logged in: @${normalizedUsername}`, 'success', {
+        accountId: data.id,
+        username: normalizedUsername,
+      });
     } catch (loginError) {
       console.error('Auto-login error (non-fatal):', loginError);
+      await logActivity(userId, `Account created but auto-login failed: @${normalizedUsername}`, 'warning', {
+        accountId: data.id,
+        username: normalizedUsername,
+        error: loginError.message,
+      });
       // Don't fail account creation if login fails - user can retry later
     }
 
@@ -655,6 +665,10 @@ router.post(
     const result = await loginAccount(account.id, account.instagram_username, password);
 
     if (result.success) {
+      await logActivity(userId, `Account re-logged in: @${account.instagram_username}`, 'success', {
+        accountId: account.id,
+        username: account.instagram_username,
+      });
       res.json({
         message: 'Account re-logged in successfully',
         account: {
@@ -663,6 +677,10 @@ router.post(
         }
       });
     } else {
+      await logActivity(userId, `Account re-login failed: @${account.instagram_username}`, 'error', {
+        accountId: account.id,
+        username: account.instagram_username,
+      }, result.error || 'Unknown error during login');
       res.status(500).json({
         error: 'Re-login failed',
         message: result.error || 'Unknown error during login'
