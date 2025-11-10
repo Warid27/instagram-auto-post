@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from '../contexts/ToastContext'
@@ -28,11 +28,13 @@ const Reviews = () => {
   const [reviewing, setReviewing] = useState(false)
   const [selectedReview, setSelectedReview] = useState(null)
   const [comparison, setComparison] = useState(null)
+  const [notifications, setNotifications] = useState([])
+  const notificationIdsRef = useRef(new Set())
   const { user } = useAuth()
   const toast = useToast()
 
   // Fetch accounts
-  const fetchAccounts = async () => {
+  const fetchAccounts = useCallback(async () => {
     if (!user) return
 
     try {
@@ -49,10 +51,10 @@ const Reviews = () => {
       console.error('Error fetching accounts:', error)
       toast.error('Error', 'Failed to load accounts')
     }
-  }
+  }, [toast, user])
 
   // Fetch reviews
-  const fetchReviews = async () => {
+  const fetchReviews = useCallback(async () => {
     if (!user) return
 
     try {
@@ -67,14 +69,59 @@ const Reviews = () => {
     } finally {
       setLoading(false)
     }
-  }
+  }, [toast, user])
+
+  const fetchNotifications = useCallback(async () => {
+    if (!user) return
+
+    try {
+      const { data, error } = await api.get('/reviewer/notifications', {
+        params: {
+          unreadOnly: true,
+          limit: 10,
+        },
+      })
+
+      if (error) throw new Error(error)
+
+      const newNotifications = (data?.notifications || []).filter(
+        (notification) => !notificationIdsRef.current.has(notification.id)
+      )
+
+      if (newNotifications.length > 0) {
+        newNotifications.forEach((notification) => {
+          notificationIdsRef.current.add(notification.id)
+          if (notification.message) {
+            toast.info('Review Update', notification.message)
+          }
+        })
+
+        setNotifications((prev) => [...newNotifications, ...prev].slice(0, 10))
+
+        // Mark notifications as read after displaying
+        await Promise.all(
+          newNotifications.map((notification) =>
+            api.post(`/reviewer/notifications/${notification.id}/read`)
+          )
+        )
+      }
+    } catch (error) {
+      console.error('Error fetching review notifications:', error)
+    }
+  }, [toast, user])
 
   useEffect(() => {
     if (!user) return
 
     fetchAccounts()
     fetchReviews()
-  }, [user])
+    fetchNotifications()
+    const interval = setInterval(fetchNotifications, 15000)
+
+    return () => {
+      clearInterval(interval)
+    }
+  }, [fetchAccounts, fetchNotifications, fetchReviews, user])
 
   // Handle review trigger
   const handleReview = async () => {
@@ -151,6 +198,36 @@ const Reviews = () => {
 
   return (
     <div className="space-y-6">
+      {notifications.length > 0 && (
+        <Card className="border-purple-200 bg-purple-50">
+          <CardContent className="p-4">
+            <div className="flex items-start justify-between">
+              <div>
+                <h2 className="text-lg font-semibold text-purple-700">Recent Review Updates</h2>
+                <ul className="mt-2 space-y-1">
+                  {notifications.map((notification) => (
+                    <li key={notification.id} className="text-sm text-purple-900">
+                      <span className="font-medium">{notification.status?.toUpperCase()}:</span>{' '}
+                      {notification.message || 'Review update'}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setNotifications([])
+                  notificationIdsRef.current.clear()
+                  api.post('/reviewer/notifications/read-all')
+                }}
+              >
+                Clear
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -354,18 +431,18 @@ const Reviews = () => {
               <div>
                 <h3 className="text-lg font-semibold mb-4">Post Analytics</h3>
                 {selectedReview.posts && selectedReview.posts.length > 0 ? (
-                  <div className="space-y-3">
+                  <div className="space-y-4">
                     {selectedReview.posts.map((post, index) => (
                       <div key={index} className="border border-gray-200 rounded-lg p-4">
                         <a
                           href={post.post_url}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="text-purple-600 hover:underline mb-2 block"
+                          className="text-purple-600 hover:underline mb-3 block font-medium"
                         >
-                          View Post
+                          View Post →
                         </a>
-                        <div className="grid grid-cols-3 gap-4">
+                        <div className="grid grid-cols-3 gap-4 mb-4">
                           <div className="flex items-center space-x-2">
                             <Eye className="w-4 h-4 text-gray-500" />
                             <span className="text-sm text-gray-600">Views:</span>
@@ -382,6 +459,33 @@ const Reviews = () => {
                             <span className="font-semibold">{formatNumber(post.comments_count)}</span>
                           </div>
                         </div>
+                        
+                        {/* Comments Section */}
+                        {post.comments && post.comments.length > 0 && (
+                          <div className="mt-4 pt-4 border-t border-gray-200">
+                            <h4 className="text-sm font-semibold text-gray-700 mb-3">
+                              Comments ({post.comments.length})
+                            </h4>
+                            <div className="space-y-2 max-h-60 overflow-y-auto">
+                              {post.comments.map((comment, commentIndex) => (
+                                <div
+                                  key={commentIndex}
+                                  className={`text-sm ${
+                                    comment.is_reply ? 'ml-6 pl-3 border-l-2 border-gray-200' : ''
+                                  }`}
+                                >
+                                  <span className="font-semibold text-purple-600">
+                                    @{comment.username}
+                                  </span>
+                                  {comment.is_reply && (
+                                    <span className="text-xs text-gray-500 ml-2">(reply)</span>
+                                  )}
+                                  <span className="text-gray-700 ml-2">{comment.comment_text}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>

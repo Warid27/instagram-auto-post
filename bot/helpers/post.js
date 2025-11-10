@@ -349,42 +349,19 @@ export async function postToInstagram(page, imageUrl, caption, options = {}) {
         }
       }
       
-      // If we don't have a post URL yet, navigate to the user's profile
+      // If we don't have a post URL yet, use the review helper function
       if (!postUrl && options.username) {
         log('info', 'Navigating to user profile to find new post', { username: options.username })
         try {
-          await page.goto(`https://www.instagram.com/${options.username}/`, { 
-            waitUntil: 'networkidle2', 
-            timeout: navTimeout 
-          })
-          await sleep(randomDelay(2000, 3000))
-          
-          // Get the first post from the profile grid (should be the newly created one)
-          const profilePostUrl = await page.evaluate(() => {
-            // Look for post links in the profile grid
-            const postLinks = Array.from(document.querySelectorAll('a[href*="/p/"]'))
-            // Filter to only get links that are actual post links (not in navigation, etc.)
-            const gridPosts = postLinks.filter(link => {
-              const href = link.getAttribute('href')
-              // Profile grid posts are typically in article or div containers
-              const parent = link.closest('article, div[role="button"]')
-              return parent && href && href.startsWith('/p/')
-            })
-            
-            if (gridPosts.length > 0) {
-              const href = gridPosts[0].getAttribute('href')
-              // Make sure it's a full URL
-              if (href.startsWith('/')) {
-                return 'https://www.instagram.com' + href
-              }
-              return href
-            }
-            return null
-          })
+          // Import and use the review helper function
+          const { getNewPostUrl } = await import('./review.js')
+          const profilePostUrl = await getNewPostUrl(page, options.username)
           
           if (profilePostUrl) {
             postUrl = profilePostUrl
             log('info', 'Found post URL from profile', { postUrl })
+          } else {
+            log('warn', 'Could not find post URL from profile', { username: options.username })
           }
         } catch (profileErr) {
           log('warn', 'Failed to get post URL from profile', { error: profileErr.message })

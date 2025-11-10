@@ -249,6 +249,11 @@ async function processPost(browser, post) {
         log('info', `Posting to @${account.instagram_username} (attempt ${attempt})`, { postId: post.id })
         const res = await postToInstagram(page, post, account)
         if (res.success) {
+          // If post succeeded but no URL, mark as failed
+          if (!res.url) {
+            throw new Error('Post succeeded but could not retrieve post URL. Marking as failed.')
+          }
+          
           success = true
           postedUrl = res.url
 

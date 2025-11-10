@@ -51,69 +51,169 @@ export async function getAccountStats(page, username) {
     await sleep(random(2000, 4000))
     
     // Extract stats from profile page
-    const stats = await page.evaluate(() => {
-      const stats = {
-        postsCount: 0,
-        followersCount: 0,
-        followingCount: 0
+    const stats = await page.evaluate(async (profileUsername) => {
+      const result = {
+        postsCount: null,
+        followersCount: null,
+        followingCount: null,
       }
-      
-      // Find all stat elements - Instagram uses various selectors
-      const statSelectors = [
-        'header section ul li',
-        'header section div[role="menubar"] li',
-        'header section ul[role="menubar"] li'
-      ]
-      
-      let statElements = []
-      for (const selector of statSelectors) {
-        statElements = Array.from(document.querySelectorAll(selector))
-        if (statElements.length >= 3) break
-      }
-      
-      if (statElements.length >= 3) {
-        // Usually: Posts, Followers, Following
-        const postsText = statElements[0]?.textContent || ''
-        const followersText = statElements[1]?.textContent || ''
-        const followingText = statElements[2]?.textContent || ''
-        
-        // Extract numbers
-        const postsMatch = postsText.match(/[\d,KMkm]+/)
-        const followersMatch = followersText.match(/[\d,KMkm]+/)
-        const followingMatch = followingText.match(/[\d,KMkm]+/)
-        
-        if (postsMatch) {
-          stats.postsCount = postsMatch[0]
+
+      const applyCounts = (user) => {
+        if (!user || typeof user !== 'object') return
+        if (user.edge_owner_to_timeline_media?.count !== undefined) {
+          result.postsCount = user.edge_owner_to_timeline_media.count
         }
-        if (followersMatch) {
-          stats.followersCount = followersMatch[0]
+        if (user.edge_followed_by?.count !== undefined) {
+          result.followersCount = user.edge_followed_by.count
         }
-        if (followingMatch) {
-          stats.followingCount = followingMatch[0]
+        if (user.edge_follow?.count !== undefined) {
+          result.followingCount = user.edge_follow.count
+        }
+        if (typeof user.media_count === 'number') {
+          result.postsCount = user.media_count
+        }
+        if (typeof user.follower_count === 'number') {
+          result.followersCount = user.follower_count
+        }
+        if (typeof user.following_count === 'number') {
+          result.followingCount = user.following_count
         }
       }
-      
-      // Fallback: Try to find in meta tags or script tags
-      if (stats.postsCount === 0) {
-        const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+
+      // 1) Try Instagram web profile API
+      try {
+        const response = await fetch(
+          `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(profileUsername)}`,
+          {
+            credentials: 'include',
+            headers: {
+              'X-IG-App-ID': '936619743392459',
+              Accept: 'application/json',
+            },
+          }
+        )
+        if (response.ok) {
+          const json = await response.json()
+          applyCounts(json?.data?.user)
+        }
+      } catch (e) {
+        // Ignore API errors
+      }
+
+      // 2) Try __additionalData
+      try {
+        const additionalData = window.__additionalData
+        if (additionalData) {
+          const key = `/${profileUsername}/`
+          const payload =
+            additionalData[key]?.data?.user ||
+            additionalData[key]?.data?.graphql?.user ||
+            additionalData[key]?.data?.profile_user
+          applyCounts(payload)
+        }
+      } catch (e) {
+        // Ignore
+      }
+
+      // 3) Try __NEXT_DATA__
+      try {
+        const nextDataScript = document.querySelector('script#__NEXT_DATA__')
+        if (nextDataScript?.textContent) {
+          const nextData = JSON.parse(nextDataScript.textContent)
+          const graphqlUser = nextData?.props?.pageProps?.graphql?.user
+          applyCounts(graphqlUser)
+
+          const apolloState = nextData?.props?.pageProps?.apolloState
+          if (apolloState && typeof apolloState === 'object') {
+            for (const value of Object.values(apolloState)) {
+              if (value && typeof value === 'object') {
+                if (
+                  value.__typename === 'GraphProfile' ||
+                  value.__typename === 'GraphUser' ||
+                  value.__typename === 'User' ||
+                  value.__typename === 'ProfilePublicUser'
+                ) {
+                  applyCounts(value)
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore JSON parse errors
+      }
+
+      const extractNumber = (text) => {
+        if (!text) return null
+        const match = text.replace(/\s+/g, ' ').match(/[\d.,KMkm]+/)
+        return match ? match[0] : null
+      }
+
+      // 4) Fallback: parse visible DOM elements
+      if (result.postsCount === null || result.followersCount === null || result.followingCount === null) {
+        const statSelectors = [
+          'header section ul li span',
+          'header section ul li div span',
+          'header section ul li',
+          'header section div[role="menubar"] li',
+          'header section ul[role="menubar"] li',
+        ]
+
+        let statElements = []
+        for (const selector of statSelectors) {
+          statElements = Array.from(document.querySelectorAll(selector))
+          if (statElements.length >= 3) break
+        }
+
+        if (statElements.length >= 3) {
+          if (result.postsCount === null) {
+            result.postsCount = extractNumber(statElements[0]?.textContent || '')
+          }
+          if (result.followersCount === null) {
+            result.followersCount = extractNumber(statElements[1]?.textContent || '')
+          }
+          if (result.followingCount === null) {
+            result.followingCount = extractNumber(statElements[2]?.textContent || '')
+          }
+        }
+      }
+
+      // 5) Final fallback: look through script tags
+      if (result.postsCount === null || result.followersCount === null || result.followingCount === null) {
+        const scripts = Array.from(
+          document.querySelectorAll('script[type="application/ld+json"], script[type="application/json"]')
+        )
         for (const script of scripts) {
           try {
             const data = JSON.parse(script.textContent)
-            if (data.interactionStatistic) {
-              for (const stat of data.interactionStatistic) {
-                if (stat.interactionType === 'https://schema.org/FollowAction') {
-                  stats.followersCount = stat.userInteractionCount || 0
-                }
-              }
+            if (data?.mainEntityofPage?.interactionStatistic) {
+              applyCounts(data.mainEntityofPage.interactionStatistic)
+            }
+            if (data?.interactionStatistic) {
+              applyCounts(data.interactionStatistic)
+            }
+            if (data?.entry_data?.ProfilePage?.[0]?.graphql?.user) {
+              applyCounts(data.entry_data.ProfilePage[0].graphql.user)
             }
           } catch (e) {
             // Ignore JSON parse errors
           }
         }
       }
-      
-      return stats
-    })
+
+      const normalizeValue = (value) => {
+        if (value === null || value === undefined) return 0
+        if (typeof value === 'number') return value
+        if (typeof value === 'string') return value
+        return 0
+      }
+
+      return {
+        postsCount: normalizeValue(result.postsCount),
+        followersCount: normalizeValue(result.followersCount),
+        followingCount: normalizeValue(result.followingCount),
+      }
+    }, username)
     
     // Parse the counts
     return {
@@ -170,6 +270,165 @@ export async function getPostUrls(page, username, limit = 12) {
     return postUrls
   } catch (error) {
     throw new Error(`Failed to get post URLs: ${error.message}`)
+  }
+}
+
+/**
+ * Get comments from a post page
+ * Returns: Array of { username, commentText, isReply, parentCommentId }
+ */
+export async function getPostComments(page, postUrl) {
+  try {
+    await page.goto(postUrl, {
+      waitUntil: 'networkidle2',
+      timeout: 60000
+    })
+    
+    await sleep(random(2000, 3000))
+    
+    // Scroll to load more comments
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight)
+    })
+    await sleep(random(1000, 2000))
+    
+    // Click "View more comments" if exists
+    try {
+      const viewMoreButton = await page.$('button:has-text("View more comments"), button:has-text("View replies")')
+      if (viewMoreButton) {
+        await viewMoreButton.click()
+        await sleep(random(1000, 2000))
+      }
+    } catch (e) {
+      // Ignore if button doesn't exist
+    }
+    
+    const comments = await page.evaluate(() => {
+      const result = []
+      
+      // Find all comment containers
+      const commentSelectors = [
+        'article ul li',
+        'article div[role="button"]',
+        'ul[role="list"] li',
+        'div[data-testid="comment"]'
+      ]
+      
+      let commentElements = []
+      for (const selector of commentSelectors) {
+        commentElements = Array.from(document.querySelectorAll(selector))
+        if (commentElements.length > 0) break
+      }
+      
+      // If no specific comment elements found, try to find by text patterns
+      if (commentElements.length === 0) {
+        // Look for elements containing usernames and comment text
+        const allElements = Array.from(document.querySelectorAll('span, div, p'))
+        commentElements = allElements.filter(el => {
+          const text = el.textContent || ''
+          // Look for patterns like "@username comment text"
+          return text.includes('@') && text.length > 10 && text.length < 500
+        })
+      }
+      
+      for (const element of commentElements) {
+        try {
+          const text = element.textContent || ''
+          
+          // Skip if too short or doesn't look like a comment
+          if (text.length < 3 || text.length > 1000) continue
+          
+          // Try to extract username (usually starts with @)
+          const usernameMatch = text.match(/@(\w+)/)
+          if (!usernameMatch) continue
+          
+          const username = usernameMatch[1]
+          
+          // Extract comment text (everything after username)
+          let commentText = text.replace(/@\w+\s*/, '').trim()
+          
+          // Check if this is a reply (usually indented or has "Replying to" text)
+          const isReply = element.closest('ul ul') !== null || 
+                         text.toLowerCase().includes('replying to') ||
+                         element.getAttribute('style')?.includes('margin-left') ||
+                         element.getAttribute('style')?.includes('padding-left')
+          
+          // Skip if we already have this comment (avoid duplicates)
+          const isDuplicate = result.some(c => 
+            c.username === username && c.commentText === commentText
+          )
+          
+          if (!isDuplicate && commentText.length > 0) {
+            result.push({
+              username,
+              commentText,
+              isReply: isReply || false
+            })
+          }
+        } catch (e) {
+          // Skip this element if there's an error
+          continue
+        }
+      }
+      
+      // Try alternative method: look for comment structure in article
+      const article = document.querySelector('article')
+      if (article && result.length === 0) {
+        const articleText = article.textContent || ''
+        // Look for patterns like "@username: comment" or "@username comment"
+        const commentPattern = /@(\w+)[:\s]+([^\n@]+)/g
+        let match
+        while ((match = commentPattern.exec(articleText)) !== null) {
+          const username = match[1]
+          const commentText = match[2].trim()
+          
+          if (commentText.length > 0 && commentText.length < 500) {
+            const isDuplicate = result.some(c => 
+              c.username === username && c.commentText === commentText
+            )
+            
+            if (!isDuplicate) {
+              result.push({
+                username,
+                commentText,
+                isReply: false
+              })
+            }
+          }
+        }
+      }
+      
+      return result
+    })
+    
+    // Process replies - try to match them to parent comments
+    const processedComments = []
+    const mainComments = comments.filter(c => !c.isReply)
+    const replies = comments.filter(c => c.isReply)
+    
+    // Add main comments first
+    for (const comment of mainComments) {
+      processedComments.push({
+        username: comment.username,
+        commentText: comment.commentText,
+        isReply: false,
+        parentCommentId: null
+      })
+    }
+    
+    // Add replies (for now, we'll link them later if we can identify parents)
+    for (const reply of replies) {
+      processedComments.push({
+        username: reply.username,
+        commentText: reply.commentText,
+        isReply: true,
+        parentCommentId: null // Will be set when saving to DB if we can match
+      })
+    }
+    
+    return processedComments
+  } catch (error) {
+    throw new Error(`Failed to get comments for ${postUrl}: ${error.message}`)
   }
 }
 
@@ -336,9 +595,50 @@ export async function getPostStats(page, postUrl) {
 }
 
 /**
+ * Get post URL from profile after posting
+ * This can be used by post bot to get the URL of a newly posted image
+ * Returns: post URL or null
+ */
+export async function getNewPostUrl(page, username) {
+  try {
+    // Navigate to profile
+    await page.goto(`https://www.instagram.com/${username}/`, {
+      waitUntil: 'networkidle2',
+      timeout: 60000
+    })
+    
+    await sleep(random(2000, 3000))
+    
+    // Get the first post URL (should be the newly created one)
+    const postUrl = await page.evaluate(() => {
+      const postLinks = Array.from(document.querySelectorAll('a[href*="/p/"]'))
+      // Filter to only get links that are actual post links
+      const gridPosts = postLinks.filter(link => {
+        const href = link.getAttribute('href')
+        const parent = link.closest('article, div[role="button"]')
+        return parent && href && href.startsWith('/p/')
+      })
+      
+      if (gridPosts.length > 0) {
+        const href = gridPosts[0].getAttribute('href')
+        if (href.startsWith('/')) {
+          return 'https://www.instagram.com' + href
+        }
+        return href
+      }
+      return null
+    })
+    
+    return postUrl
+  } catch (error) {
+    throw new Error(`Failed to get new post URL: ${error.message}`)
+  }
+}
+
+/**
  * Review an Instagram account
  * Logs in, gets account stats, and post stats for recent posts
- * Returns: { accountStats, posts: [{ url, stats }] }
+ * Returns: { accountStats, posts: [{ url, stats, comments }] }
  */
 export async function reviewAccount(page, account) {
   try {
@@ -371,20 +671,30 @@ export async function reviewAccount(page, account) {
     // 3. Get post URLs (limit to 12 most recent)
     const postUrls = await getPostUrls(page, account.instagram_username, 12)
     
-    // 4. Get stats for each post
+    // 4. Get stats and comments for each post
     const posts = []
     for (const postUrl of postUrls) {
       try {
         const postStats = await getPostStats(page, postUrl)
+        const comments = await getPostComments(page, postUrl)
+        
         posts.push({
           url: postUrl,
-          ...postStats
+          ...postStats,
+          comments: comments || []
         })
         // Small delay between posts
-        await sleep(random(1000, 2000))
+        await sleep(random(2000, 3000))
       } catch (error) {
-        console.warn(`Failed to get stats for post ${postUrl}:`, error.message)
-        // Continue with other posts
+        console.warn(`Failed to get stats/comments for post ${postUrl}:`, error.message)
+        // Continue with other posts, but include the post with empty stats
+        posts.push({
+          url: postUrl,
+          viewsCount: 0,
+          likesCount: 0,
+          commentsCount: 0,
+          comments: []
+        })
       }
     }
     

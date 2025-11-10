@@ -8,6 +8,7 @@ import { createClient } from '@supabase/supabase-js'
 import winston from 'winston'
 import 'winston-daily-rotate-file'
 import { reviewAccount } from './helpers/review.js'
+import axios from 'axios'
 
 // Load environment variables
 dotenv.config()
@@ -20,9 +21,11 @@ puppeteer.use(StealthPlugin())
 
 // Config
 const CONFIG = {
-  headless: process.env.HEADLESS === 'true',
+  headless: process.env.HEADLESS !== 'false', // Default to headless (true) unless explicitly set to false
   pageLoadTimeout: parseInt(process.env.PAGE_LOAD_TIMEOUT || '30000', 10),
   logLevel: (process.env.LOG_LEVEL || 'info').toLowerCase(),
+  backendApiUrl: process.env.BACKEND_API_URL || process.env.API_URL || 'http://localhost:3001',
+  notifySecret: process.env.REVIEW_NOTIFY_SECRET || process.env.BOT_INTERNAL_SECRET || null,
 }
 
 // Initialize Supabase client (service role in bot)
@@ -72,6 +75,28 @@ async function logActivity(type, message, details = '', userId = null) {
   } catch {}
 }
 
+async function notifyBackend(userId, payload) {
+  if (!CONFIG.backendApiUrl || !CONFIG.notifySecret) return
+  try {
+    await axios.post(
+      `${CONFIG.backendApiUrl.replace(/\/$/, '')}/api/reviewer/notify`,
+      { ...payload, userId },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-internal-key': CONFIG.notifySecret,
+        },
+        timeout: 15000,
+      }
+    )
+  } catch (error) {
+    log('warn', 'Failed to notify backend about review status', {
+      error: error.message,
+      endpoint: `${CONFIG.backendApiUrl}/api/reviewer/notify`,
+    })
+  }
+}
+
 /**
  * Review a single account
  * @param {string} accountId - Account ID to review
@@ -103,15 +128,17 @@ export async function reviewAccountById(accountId, userId) {
       username: account.instagram_username,
     }, userId)
 
-    // Launch browser
+    // Launch browser in headless mode (no visible window) - runs silently on server
     browser = await puppeteer.launch({
-      headless: CONFIG.headless ? 'new' : false,
+      headless: 'new', // Always run headless - no visible browser window
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
+        '--disable-blink-features=AutomationControlled',
+        '--window-size=1920,1080',
       ],
     })
 
@@ -165,32 +192,87 @@ export async function reviewAccountById(accountId, userId) {
         postCount: reviewResult.posts.length,
       }, userId)
 
-      const postRecords = reviewResult.posts.map((post) => ({
-        review_id: reviewId,
-        post_url: post.url,
-        views_count: post.viewsCount,
-        likes_count: post.likesCount,
-        comments_count: post.commentsCount,
-      }))
+      // Save posts and their comments
+      for (const post of reviewResult.posts) {
+        try {
+          // Insert post record
+          const { data: savedPost, error: postInsertError } = await supabase
+            .from('account_review_posts')
+            .insert({
+              review_id: reviewId,
+              post_url: post.url,
+              views_count: post.viewsCount,
+              likes_count: post.likesCount,
+              comments_count: post.commentsCount,
+            })
+            .select('id')
+            .single()
 
-      const { error: postsError } = await supabase
-        .from('account_review_posts')
-        .insert(postRecords)
+          if (postInsertError) {
+            log('warn', `Failed to save post: ${post.url}`, { error: postInsertError.message })
+            continue
+          }
 
-      if (postsError) {
-        log('warn', `Failed to save some post stats: ${postsError.message}`, { reviewId })
-        await logActivity('warning', `Failed to save post stats: ${postsError.message}`, {
-          accountId,
-          reviewId,
-        }, userId)
-        // Don't fail the whole review if post stats fail
-      } else {
-        await logActivity('success', `Post stats saved: ${reviewResult.posts.length} posts`, {
-          accountId,
-          reviewId,
-          postCount: reviewResult.posts.length,
-        }, userId)
+          // Save comments if any
+          if (post.comments && post.comments.length > 0) {
+            const mainComments = post.comments.filter(c => !c.isReply)
+            const replies = post.comments.filter(c => c.isReply)
+
+            // Save main comments first
+            const mainCommentRecords = mainComments.map(comment => ({
+              review_post_id: savedPost.id,
+              username: comment.username,
+              comment_text: comment.commentText,
+              is_reply: false,
+              parent_comment_id: null,
+            }))
+
+            if (mainCommentRecords.length > 0) {
+              const { data: savedMainComments, error: mainCommentsError } = await supabase
+                .from('review_comments')
+                .insert(mainCommentRecords)
+                .select('id, username, comment_text')
+
+              if (mainCommentsError) {
+                log('warn', `Failed to save main comments for post ${post.url}`, {
+                  error: mainCommentsError.message,
+                })
+              } else {
+                // Try to match replies to parent comments
+                // For now, we'll save replies without parent links (can be improved later)
+                const replyRecords = replies.map(reply => ({
+                  review_post_id: savedPost.id,
+                  username: reply.username,
+                  comment_text: reply.commentText,
+                  is_reply: true,
+                  parent_comment_id: null, // Could be improved to match by username/context
+                }))
+
+                if (replyRecords.length > 0) {
+                  const { error: repliesError } = await supabase
+                    .from('review_comments')
+                    .insert(replyRecords)
+
+                  if (repliesError) {
+                    log('warn', `Failed to save replies for post ${post.url}`, {
+                      error: repliesError.message,
+                    })
+                  }
+                }
+              }
+            }
+          }
+        } catch (postError) {
+          log('warn', `Error processing post ${post.url}`, { error: postError.message })
+          // Continue with next post
+        }
       }
+
+      await logActivity('success', `Post stats and comments saved: ${reviewResult.posts.length} posts`, {
+        accountId,
+        reviewId,
+        postCount: reviewResult.posts.length,
+      }, userId)
     } else {
       await logActivity('warning', `No posts found for @${account.instagram_username}`, {
         accountId,
@@ -212,6 +294,15 @@ export async function reviewAccountById(accountId, userId) {
       stats: reviewResult.accountStats,
     }, userId)
 
+    await notifyBackend(userId, {
+      accountId,
+      reviewId,
+      status: 'completed',
+      message: `Review completed for @${account.instagram_username}`,
+      postsCount: reviewResult.posts?.length || 0,
+      stats: reviewResult.accountStats,
+    })
+
     await browser.close()
 
     return {
@@ -231,6 +322,14 @@ export async function reviewAccountById(accountId, userId) {
       accountId,
       error: error.message,
     }, userId)
+
+    await notifyBackend(userId, {
+      accountId,
+      reviewId: reviewId || null,
+      status: 'failed',
+      message: `Review failed for @${accountId}`,
+      error: error.message,
+    })
 
     if (browser) {
       try {

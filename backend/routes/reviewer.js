@@ -14,6 +14,26 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
+const INTERNAL_NOTIFY_KEY = process.env.REVIEW_NOTIFY_SECRET || process.env.BOT_INTERNAL_SECRET || null
+
+function verifyInternalKey(req, res, next) {
+  if (!INTERNAL_NOTIFY_KEY) {
+    return res.status(500).json({
+      error: 'Internal notification key not configured',
+      message: 'Set REVIEW_NOTIFY_SECRET or BOT_INTERNAL_SECRET in backend environment',
+    })
+  }
+
+  const key = req.headers['x-internal-key'] || req.headers['x-internal-secret']
+  if (!key || key !== INTERNAL_NOTIFY_KEY) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Invalid internal key',
+    })
+  }
+  return next()
+}
+
 /**
  * POST /api/reviewer/review
  * Trigger a review for one or more accounts
@@ -95,6 +115,57 @@ router.post('/review', authenticateUser, async (req, res) => {
 })
 
 /**
+ * POST /api/reviewer/notify
+ * Internal endpoint for bots to send review completion flags
+ */
+router.post('/notify', verifyInternalKey, async (req, res) => {
+  try {
+    const { userId, accountId, reviewId, status, message, details } = req.body
+
+    if (!userId || !accountId || !status) {
+      return res.status(400).json({
+        error: 'Validation error',
+        message: 'userId, accountId, and status are required',
+      })
+    }
+
+    const payload = {
+      user_id: userId,
+      account_id: accountId,
+      review_id: reviewId || null,
+      status,
+      message: message || null,
+      details: details && typeof details === 'object' ? details : details ? { value: details } : null,
+    }
+
+    const { data, error } = await supabase
+      .from('review_notifications')
+      .insert(payload)
+      .select('id, created_at')
+      .single()
+
+    if (error) {
+      console.error('Supabase error (notify):', error)
+      return res.status(500).json({
+        error: 'Failed to store notification',
+        message: error.message,
+      })
+    }
+
+    res.json({
+      success: true,
+      notification: data,
+    })
+  } catch (error) {
+    console.error('Error handling review notification:', error)
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message,
+    })
+  }
+})
+
+/**
  * GET /api/reviewer/reviews
  * Get review history for accounts
  */
@@ -150,6 +221,124 @@ router.get('/reviews', authenticateUser, async (req, res) => {
 })
 
 /**
+ * GET /api/reviewer/notifications
+ * Fetch review notification flags for user
+ */
+router.get('/notifications', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id
+    const { since, limit = 25, unreadOnly = 'false' } = req.query
+
+    let query = supabase
+      .from('review_notifications')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit, 10))
+
+    if (since) {
+      query = query.gte('created_at', since)
+    }
+    if (unreadOnly === 'true') {
+      query = query.is('read_at', null)
+    }
+
+    const { data, error } = await query
+
+    if (error) {
+      console.error('Supabase error (notifications):', error)
+      return res.status(500).json({
+        error: 'Failed to fetch notifications',
+        message: error.message,
+      })
+    }
+
+    res.json({
+      notifications: data || [],
+      count: data?.length || 0,
+    })
+  } catch (error) {
+    console.error('Error fetching review notifications:', error)
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message,
+    })
+  }
+})
+
+/**
+ * POST /api/reviewer/notifications/:id/read
+ * Mark a review notification as read
+ */
+router.post('/notifications/:id/read', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id
+    const { id } = req.params
+
+    const { data, error } = await supabase
+      .from('review_notifications')
+      .update({ read_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select('id, read_at')
+      .single()
+
+    if (error) {
+      console.error('Supabase error (mark read):', error)
+      return res.status(500).json({
+        error: 'Failed to mark notification as read',
+        message: error.message,
+      })
+    }
+
+    res.json({
+      success: true,
+      notification: data,
+    })
+  } catch (error) {
+    console.error('Error marking notification as read:', error)
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message,
+    })
+  }
+})
+
+/**
+ * POST /api/reviewer/notifications/read-all
+ * Mark all review notifications as read
+ */
+router.post('/notifications/read-all', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id
+
+    const { error } = await supabase
+      .from('review_notifications')
+      .update({ read_at: new Date().toISOString() })
+      .eq('user_id', userId)
+      .is('read_at', null)
+
+    if (error) {
+      console.error('Supabase error (mark all read):', error)
+      return res.status(500).json({
+        error: 'Failed to mark notifications as read',
+        message: error.message,
+      })
+    }
+
+    res.json({
+      success: true,
+    })
+  } catch (error) {
+    console.error('Error marking all notifications as read:', error)
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message,
+    })
+  }
+})
+
+/**
  * GET /api/reviewer/reviews/:reviewId
  * Get a specific review with post details
  */
@@ -191,10 +380,20 @@ router.get('/reviews/:reviewId', authenticateUser, async (req, res) => {
       })
     }
 
-    // Get post details
+    // Get post details with comments
     const { data: posts, error: postsError } = await supabase
       .from('account_review_posts')
-      .select('*')
+      .select(`
+        *,
+        comments:review_comments (
+          id,
+          username,
+          comment_text,
+          is_reply,
+          parent_comment_id,
+          created_at
+        )
+      `)
       .eq('review_id', reviewId)
       .order('created_at', { ascending: false })
 

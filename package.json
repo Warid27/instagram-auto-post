@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start:all": "concurrently \"npm run start --prefix backend\" \"npm run start --prefix bot\" \"npm run dev --prefix dashboard\" --names \"backend,bot,dashboard\" --prefix-colors \"blue,green,yellow\""
+    "start:all": "concurrently \"npm run start --prefix backend\" \"npm run start --prefix bot\" \"npm run dev --prefix dashboard\" --names \"backend,bot,dashboard\" --prefix-colors \"blue,green,yellow\"",
+    "push": "git add . && cz && git push"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
