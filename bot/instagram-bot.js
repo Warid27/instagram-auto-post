@@ -212,10 +212,21 @@ async function postToInstagram(page, post, account) {
   }
 }
 
-// Process a single post with retries
-async function processPost(browser, post, cyclePostCount = { current: 0, max: CONFIG.maxPostsPerDay }) {
-  const page = await browser.newPage()
-  page.setDefaultNavigationTimeout(CONFIG.pageLoadTimeout)
+// Process a single post using one browser and incognito contexts per account
+async function processPost(post, cyclePostCount = { current: 0, max: CONFIG.maxPostsPerDay }) {
+  // Launch a single browser for all accounts in this post
+  const browser = await puppeteer.launch({
+    headless: CONFIG.headless ? 'new' : false,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=1920,1080',
+    ],
+  })
 
   // Determine accounts to post to
   const targetAccounts = (post.post_accounts || [])
@@ -224,12 +235,12 @@ async function processPost(browser, post, cyclePostCount = { current: 0, max: CO
 
   let results = []
 
-  for (const account of targetAccounts) {
+  try {
+    for (const account of targetAccounts) {
     // Check cycle post limit before processing
     log('info', `Post limit check: ${cyclePostCount.current}/${cyclePostCount.max} posts in this cycle`)
     if (cyclePostCount.current >= cyclePostCount.max) {
       log('info', `Post limit reached (${cyclePostCount.current}/${cyclePostCount.max}). Stopping bot cycle.`)
-      await page.close()
       return { limitReached: true, results }
     }
     // Check daily limit for the account
@@ -245,151 +256,160 @@ async function processPost(browser, post, cyclePostCount = { current: 0, max: CO
       continue
     }
 
-    // Retry loop up to 3 attempts
-    let attempt = 0
-    let success = false
-    let lastError = null
-    let postedUrl = null
+      // Create isolated incognito context per account (prevents UI state carryover)
+      const context = await browser.createIncognitoBrowserContext()
 
-    while (attempt < 3 && !success) {
-      attempt += 1
-      try {
-        log('info', `Posting to @${account.instagram_username} (attempt ${attempt})`, { postId: post.id })
-        const res = await postToInstagram(page, post, account)
-        if (res.success) {
-          // If post succeeded but no URL, mark as failed
-          if (!res.url) {
-            throw new Error('Post succeeded but could not retrieve post URL. Marking as failed.')
+      // Retry loop up to 3 attempts (new page per attempt)
+      let attempt = 0
+      let success = false
+      let lastError = null
+      let postedUrl = null
+
+      while (attempt < 3 && !success) {
+        attempt += 1
+        try {
+          const page = await context.newPage()
+          page.setDefaultNavigationTimeout(CONFIG.pageLoadTimeout)
+          log('info', `Posting to @${account.instagram_username} (attempt ${attempt})`, { postId: post.id })
+          const res = await postToInstagram(page, post, account)
+          try { await page.close() } catch {}
+          if (res.success) {
+            // If post succeeded but no URL, mark as failed
+            if (!res.url) {
+              throw new Error('Post succeeded but could not retrieve post URL. Marking as failed.')
+            }
+            
+            success = true
+            postedUrl = res.url
+
+            // update post_accounts row
+            await supabase
+              .from('post_accounts')
+              .update({ status: 'completed', instagram_post_url: postedUrl, posted_at: nowIso() })
+              .eq('post_id', post.id)
+              .eq('account_id', account.id)
+
+            // increment posts_today
+            await supabase
+              .from('accounts')
+              .update({ posts_today: postsToday + 1 })
+              .eq('id', account.id)
+
+            await logActivity('success', `Posted to @${account.instagram_username}`, { url: postedUrl || 'N/A', postId: post.id, accountId: account.id }, post.user_id)
+
+            // Run image similarity check after successful post (async, non-blocking)
+            try {
+              log('info', 'Starting image similarity check', { postId: post.id, accountId: account.id, postUrl: postedUrl })
+              
+              // Prepare post_account data for checker
+              const postAccountData = {
+                id: null, // We'll need to fetch the post_accounts id
+                post: {
+                  id: post.id,
+                  user_id: post.user_id,
+                  image_url: post.image_url,
+                  caption: post.caption,
+                },
+                account: {
+                  id: account.id,
+                  instagram_username: account.instagram_username,
+                  password_encrypted: account.password_encrypted,
+                  cookies: account.cookies,
+                  is_active: account.is_active,
+                },
+                instagram_post_url: postedUrl,
+              }
+
+              // Fetch the post_accounts id
+              const { data: postAccountRow } = await supabase
+                .from('post_accounts')
+                .select('id')
+                .eq('post_id', post.id)
+                .eq('account_id', account.id)
+                .single()
+
+              if (postAccountRow) {
+                postAccountData.id = postAccountRow.id
+                
+                // Run checker asynchronously (don't await - let it run in background)
+                // Let checker manage its own session
+                checkPostImage(postAccountData, null)
+                  .then((checkResult) => {
+                    if (checkResult.success) {
+                      log('info', 'Image similarity check completed', {
+                        postId: post.id,
+                        accountId: account.id,
+                        similarity: checkResult.similarity?.toFixed(4),
+                        isSimilar: checkResult.isSimilar,
+                      })
+                    } else {
+                      log('warn', 'Image similarity check failed', {
+                        postId: post.id,
+                        accountId: account.id,
+                        error: checkResult.error,
+                      })
+                    }
+                  })
+                  .catch((checkError) => {
+                    log('error', 'Image similarity check error', {
+                      postId: post.id,
+                      accountId: account.id,
+                      error: checkError.message,
+                    })
+                  })
+              } else {
+                log('warn', 'Could not find post_accounts record for similarity check', {
+                  postId: post.id,
+                  accountId: account.id,
+                })
+              }
+            } catch (checkErr) {
+              // Don't fail the post if checker fails
+              log('warn', 'Failed to start image similarity check', {
+                postId: post.id,
+                accountId: account.id,
+                error: checkErr.message,
+              })
+            }
+          } else {
+            throw new Error(res.error || 'Unknown failure while posting')
           }
-          
-          success = true
-          postedUrl = res.url
+        } catch (err) {
+          lastError = err
+          // Categorize errors
+          const msg = err.message || ''
+          let category = 'system'
+          if (/net::|ECONN|ETIMEDOUT|network/i.test(msg)) category = 'network'
+          else if (/instagram|csrf|login|2fa/i.test(msg)) category = 'instagram'
+          log('error', `Error posting to @${account.instagram_username}`, { error: msg, category })
+          try { 
+            await supabase.from('bot_logs').insert({ 
+              user_id: post.user_id,
+              action: 'post', 
+              status: 'error', 
+              details: { postId: post.id, accountId: account.id, category }, 
+              error: msg 
+            }) 
+          } catch {}
 
-          // update post_accounts row
+          // update post_accounts row to failed for this attempt
           await supabase
             .from('post_accounts')
-            .update({ status: 'completed', instagram_post_url: postedUrl, posted_at: nowIso() })
+            .update({ status: 'failed', error_message: err.message })
             .eq('post_id', post.id)
             .eq('account_id', account.id)
 
-          // increment posts_today
-          await supabase
-            .from('accounts')
-            .update({ posts_today: postsToday + 1 })
-            .eq('id', account.id)
-
-          await logActivity('success', `Posted to @${account.instagram_username}`, { url: postedUrl || 'N/A', postId: post.id, accountId: account.id }, post.user_id)
-
-          // Run image similarity check after successful post (async, non-blocking)
-          try {
-            log('info', 'Starting image similarity check', { postId: post.id, accountId: account.id, postUrl: postedUrl })
-            
-            // Prepare post_account data for checker
-            const postAccountData = {
-              id: null, // We'll need to fetch the post_accounts id
-              post: {
-                id: post.id,
-                user_id: post.user_id,
-                image_url: post.image_url,
-                caption: post.caption,
-              },
-              account: {
-                id: account.id,
-                instagram_username: account.instagram_username,
-                password_encrypted: account.password_encrypted,
-                cookies: account.cookies,
-                is_active: account.is_active,
-              },
-              instagram_post_url: postedUrl,
-            }
-
-            // Fetch the post_accounts id
-            const { data: postAccountRow } = await supabase
-              .from('post_accounts')
-              .select('id')
-              .eq('post_id', post.id)
-              .eq('account_id', account.id)
-              .single()
-
-            if (postAccountRow) {
-              postAccountData.id = postAccountRow.id
-              
-              // Run checker asynchronously (don't await - let it run in background)
-              // Use existing page since we're already logged in
-              checkPostImage(postAccountData, page)
-                .then((checkResult) => {
-                  if (checkResult.success) {
-                    log('info', 'Image similarity check completed', {
-                      postId: post.id,
-                      accountId: account.id,
-                      similarity: checkResult.similarity?.toFixed(4),
-                      isSimilar: checkResult.isSimilar,
-                    })
-                  } else {
-                    log('warn', 'Image similarity check failed', {
-                      postId: post.id,
-                      accountId: account.id,
-                      error: checkResult.error,
-                    })
-                  }
-                })
-                .catch((checkError) => {
-                  log('error', 'Image similarity check error', {
-                    postId: post.id,
-                    accountId: account.id,
-                    error: checkError.message,
-                  })
-                })
-            } else {
-              log('warn', 'Could not find post_accounts record for similarity check', {
-                postId: post.id,
-                accountId: account.id,
-              })
-            }
-          } catch (checkErr) {
-            // Don't fail the post if checker fails
-            log('warn', 'Failed to start image similarity check', {
-              postId: post.id,
-              accountId: account.id,
-              error: checkErr.message,
-            })
+          if (attempt < 3 && category === 'network') {
+            const delay = randomDelay(10000, 30000)
+            await sleep(delay)
+          } else {
+            break
           }
-        } else {
-          throw new Error(res.error || 'Unknown failure while posting')
-        }
-      } catch (err) {
-        lastError = err
-        // Categorize errors
-        const msg = err.message || ''
-        let category = 'system'
-        if (/net::|ECONN|ETIMEDOUT|network/i.test(msg)) category = 'network'
-        else if (/instagram|csrf|login|2fa/i.test(msg)) category = 'instagram'
-        log('error', `Error posting to @${account.instagram_username}`, { error: msg, category })
-        try { 
-          await supabase.from('bot_logs').insert({ 
-            user_id: post.user_id,
-            action: 'post', 
-            status: 'error', 
-            details: { postId: post.id, accountId: account.id, category }, 
-            error: msg 
-          }) 
-        } catch {}
-
-        // update post_accounts row to failed for this attempt
-        await supabase
-          .from('post_accounts')
-          .update({ status: 'failed', error_message: err.message })
-          .eq('post_id', post.id)
-          .eq('account_id', account.id)
-
-        if (attempt < 3 && category === 'network') {
-          const delay = randomDelay(10000, 30000)
-          await sleep(delay)
-        } else {
-          break
         }
       }
-    }
+
+      // Close the incognito context for this account
+      try { await context.close() } catch {}
 
     results.push({ accountId: account.id, success, postedUrl, error: lastError?.message })
 
@@ -409,9 +429,7 @@ async function processPost(browser, post, cyclePostCount = { current: 0, max: CO
       log('info', `Waiting ${Math.round(delayMs / 1000)}s before next account`)    
       await sleep(delayMs)
     }
-  }
-
-  await page.close()
+    }
 
   // Determine final post status
   const anySuccess = results.some((r) => r.success)
@@ -435,13 +453,15 @@ async function processPost(browser, post, cyclePostCount = { current: 0, max: CO
       .eq('id', post.id)
   }
 
-  return { limitReached: cyclePostCount.current >= cyclePostCount.max, results }
+    return { limitReached: cyclePostCount.current >= cyclePostCount.max, results }
+  } finally {
+    try { await browser.close() } catch {}
+  }
 }
 
 // Main bot run function
 export async function runBot() {
   log('info', '🤖 Bot cycle started')
-  let browser = null
 
   try {
     // Fetch queue
@@ -462,18 +482,6 @@ export async function runBot() {
         postIds: userPosts.map(p => p.id),
       }, userId)
     }
-
-    // Launch browser
-    browser = await puppeteer.launch({
-      headless: CONFIG.headless ? 'new' : false,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-      ],
-    })
 
     // Track posts in this cycle (shared across all posts)
     const cyclePostCount = {
@@ -498,7 +506,7 @@ export async function runBot() {
           .update({ status: 'processing', updated_at: nowIso() })
           .eq('id', post.id)
 
-        const result = await processPost(browser, post, cyclePostCount)
+        const result = await processPost(post, cyclePostCount)
         
         // If limit reached, stop processing more posts
         if (result && result.limitReached) {
@@ -524,12 +532,6 @@ export async function runBot() {
     log('info', '✅ Bot cycle completed')
   } catch (err) {
     log('error', '❌ Unhandled error in bot cycle', { error: err.message })
-  } finally {
-    if (browser) {
-      try {
-        await browser.close()
-      } catch {}
-    }
   }
 }
 
