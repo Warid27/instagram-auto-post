@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node process-manager.js",
     "dev": "node --watch process-manager.js",
-    "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js"
+    "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js",
+    "crawl": "node crawling-bot.js"
   },
   "dependencies": {
     "puppeteer": "^21.6.0",

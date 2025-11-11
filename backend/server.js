@@ -53,15 +53,19 @@ app.use(cors({
 app.use(requestLogger);
 
 // Rate limiting
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || `${15 * 60 * 1000}`, 10);
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '100', 10);
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX,
   message: {
     error: 'Too many requests',
     message: 'Too many requests from this IP, please try again later.',
   },
   standardHeaders: true,
   legacyHeaders: false,
+  // In development, skip rate limiting to avoid UX issues while testing
+  skip: (req, res) => process.env.NODE_ENV !== 'production',
 });
 app.use('/api/', limiter);
 

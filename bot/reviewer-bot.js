@@ -7,7 +7,8 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth'
 import { createClient } from '@supabase/supabase-js'
 import winston from 'winston'
 import 'winston-daily-rotate-file'
-import { reviewAccount } from './helpers/review.js'
+import { getAccountStats, getPostComments } from './helpers/review.js'
+import { crawlAccountPosts } from './helpers/crawling.js'
 import axios from 'axios'
 
 // Load environment variables
@@ -145,23 +146,123 @@ export async function reviewAccountById(accountId, userId) {
     const page = await browser.newPage()
     page.setDefaultNavigationTimeout(CONFIG.pageLoadTimeout)
 
-    // Perform review
+    // Perform review (now uses crawling for per-post analytics)
     log('info', `Reviewing account @${account.instagram_username}`)
     await logActivity('info', `Collecting account stats for @${account.instagram_username}`, {
       accountId,
       username: account.instagram_username,
     }, userId)
-    const reviewResult = await reviewAccount(page, account)
 
-    if (!reviewResult.success) {
-      throw new Error(reviewResult.error || 'Review failed')
-    }
+    // 1) Account-level stats
+    const accountStats = await getAccountStats(page, account.instagram_username)
 
     await logActivity('info', `Account stats collected for @${account.instagram_username}`, {
       accountId,
       username: account.instagram_username,
-      stats: reviewResult.accountStats,
+      stats: accountStats,
     }, userId)
+
+    // Skip crawl if account shows no posts
+    if (!accountStats.postsCount || accountStats.postsCount < 1) {
+      await logActivity('warning', `No posts to crawl for @${account.instagram_username}`, {
+        accountId,
+        username: account.instagram_username,
+      }, userId)
+      const reviewResult = { success: true, accountStats, posts: [] }
+
+      // Create review record in database
+      const reviewDatetime = new Date().toISOString()
+      const { data: review, error: reviewError } = await supabase
+        .from('account_reviews')
+        .insert({
+          account_id: accountId,
+          user_id: userId,
+          review_datetime: reviewDatetime,
+          posts_count: reviewResult.accountStats.postsCount,
+          followers_count: reviewResult.accountStats.followersCount,
+          following_count: reviewResult.accountStats.followingCount,
+        })
+        .select('id')
+        .single()
+
+      if (reviewError) {
+        throw new Error(`Failed to save review: ${reviewError.message}`)
+      }
+
+      reviewId = review.id
+      await logActivity('success', `Review completed (no posts) for @${account.instagram_username}`, {
+        accountId,
+        reviewId,
+      }, userId)
+
+      await browser.close()
+      return {
+        success: true,
+        reviewId,
+        accountStats: reviewResult.accountStats,
+        postsCount: 0,
+      }
+    }
+
+    // 2) Crawl recent posts for likes/comments counters
+    await logActivity('info', `Crawling recent posts for @${account.instagram_username}`, {
+      accountId,
+      username: account.instagram_username,
+    }, userId)
+    const crawl = await crawlAccountPosts(page, account, { maxPosts: 12 })
+    if (!crawl.success) {
+      throw new Error(crawl.error || 'Crawl failed')
+    }
+    await logActivity('info', `Crawl completed for @${account.instagram_username}`, {
+      accountId,
+      username: account.instagram_username,
+      postCount: crawl.posts?.length || 0,
+      sample: (crawl.posts || []).slice(0, 3).map(p => p.url),
+    }, userId)
+
+    // 3) Optionally enrich with comments for each crawled post
+    const posts = []
+    for (const post of crawl.posts) {
+      try {
+        await logActivity('info', `Fetching post stats/comments`, { accountId, postUrl: post.url }, userId)
+        const comments = await getPostComments(page, post.url)
+        posts.push({
+          url: post.url,
+          viewsCount: post.viewsCount || 0,
+          likesCount: post.likesCount || 0,
+          commentsCount: post.commentsCount || 0,
+          comments: comments || [],
+        })
+        await logActivity('info', `Fetched post stats/comments`, {
+          accountId,
+          postUrl: post.url,
+          likesCount: post.likesCount || 0,
+          commentsCount: post.commentsCount || 0,
+        }, userId)
+      } catch (_) {
+        posts.push({
+          url: post.url,
+          viewsCount: post.viewsCount || 0,
+          likesCount: post.likesCount || 0,
+          commentsCount: post.commentsCount || 0,
+          comments: [],
+        })
+      }
+    }
+
+    const reviewResult = { success: true, accountStats, posts }
+
+    // If crawl returned zero posts unexpectedly, capture screenshot for diagnostics
+    if (!reviewResult.posts || reviewResult.posts.length === 0) {
+      try {
+        const ts = new Date().toISOString().replace(/[:.]/g, '-')
+        const safeUser = (account.instagram_username || 'unknown').replace(/[^a-z0-9_-]/gi, '_')
+        const file = path.join(__dirname, 'screenshots', `crawl-${safeUser}-${ts}.png`)
+        await fs.promises.mkdir(path.join(__dirname, 'screenshots'), { recursive: true })
+        await page.screenshot({ path: file, fullPage: true })
+        await logActivity('warning', 'Crawl returned no posts; screenshot saved', { accountId, username: account.instagram_username, screenshot: file }, userId)
+      } catch {}
+    }
 
     // Create review record in database
     const reviewDatetime = new Date().toISOString()

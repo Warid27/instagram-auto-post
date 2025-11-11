@@ -241,33 +241,125 @@ export async function getPostUrls(page, username, limit = 12) {
       })
       await sleep(random(2000, 3000))
     }
-    
-    // Scroll to load more posts
-    await page.evaluate(() => {
-      window.scrollTo(0, document.body.scrollHeight)
-    })
-    await sleep(random(1000, 2000))
-    
-    // Extract post URLs
-    const postUrls = await page.evaluate((maxPosts) => {
-      const urls = []
-      const postLinks = Array.from(document.querySelectorAll('a[href*="/p/"]'))
-      
-      for (const link of postLinks) {
-        const href = link.getAttribute('href')
-        if (href && href.startsWith('/p/')) {
-          const fullUrl = href.startsWith('http') ? href : `https://www.instagram.com${href}`
-          if (!urls.includes(fullUrl)) {
-            urls.push(fullUrl)
-          }
-          if (urls.length >= maxPosts) break
+
+    // Ensure profile content is rendered
+    try {
+      await page.waitForSelector('article', { timeout: 10000 })
+    } catch {}
+
+    // Try Web Profile API first for reliability
+    try {
+      const apiResult = await page.evaluate(async (profileUsername, maxPosts) => {
+        function buildUrlFromNode(node) {
+          const shortcode = node?.shortcode
+          if (!shortcode) return null
+          // Only posts (no reels/clips)
+          return `https://www.instagram.com/p/${shortcode}/`
         }
+
+        try {
+          const response = await fetch(
+            `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(profileUsername)}`,
+            {
+              credentials: 'include',
+              headers: { 'X-IG-App-ID': '936619743392459', Accept: 'application/json' },
+            }
+          )
+          if (response.ok) {
+            const json = await response.json()
+            const edges = json?.data?.user?.edge_owner_to_timeline_media?.edges || []
+            const urls = []
+            for (const edge of edges) {
+              const node = edge?.node
+              const productType = (node?.product_type || node?.productType || '').toLowerCase()
+              if (productType === 'clips' || productType === 'igtv' || productType === 'reels') continue
+              const url = buildUrlFromNode(node)
+              if (url && !urls.includes(url)) {
+                urls.push(url)
+                if (urls.length >= maxPosts) break
+              }
+            }
+            return urls
+          }
+        } catch (e) {}
+        return null
+      }, username, limit)
+
+      if (Array.isArray(apiResult) && apiResult.length > 0) {
+        return apiResult
       }
-      
-      return urls
-    }, limit)
-    
-    return postUrls
+    } catch {}
+
+    // Second try: parse __NEXT_DATA__ for timeline media
+    try {
+      const nextDataUrls = await page.evaluate((maxPosts) => {
+        const urls = []
+        try {
+          const script = document.querySelector('script#__NEXT_DATA__')
+          if (!script?.textContent) return urls
+          const data = JSON.parse(script.textContent)
+          const user =
+            data?.props?.pageProps?.graphql?.user ||
+            data?.props?.pageProps?.profileUser ||
+            null
+          const edges = user?.edge_owner_to_timeline_media?.edges || []
+          for (const edge of edges) {
+            const node = edge?.node
+            const shortcode = node?.shortcode
+            const productType = (node?.product_type || node?.productType || '').toLowerCase()
+            if (!shortcode) continue
+            if (productType === 'clips' || productType === 'igtv' || productType === 'reels') continue
+            const url = `https://www.instagram.com/p/${shortcode}/`
+            if (!urls.includes(url)) {
+              urls.push(url)
+              if (urls.length >= maxPosts) break
+            }
+          }
+        } catch (e) {}
+        return urls
+      }, limit)
+
+      if (Array.isArray(nextDataUrls) && nextDataUrls.length > 0) {
+        return nextDataUrls
+      }
+    } catch {}
+
+    // Fallback: scroll a few times and collect anchors for posts only
+    const maxScrolls = 8
+    const urls = new Set()
+
+    for (let i = 0; i < maxScrolls && urls.size < limit; i++) {
+      // Scroll to load grid items
+      await page.evaluate(() => {
+        window.scrollTo(0, document.body.scrollHeight)
+      })
+      await sleep(random(800, 1500))
+
+      const batch = await page.evaluate((maxPosts) => {
+        const collected = []
+        const anchors = Array.from(document.querySelectorAll('a[href]'))
+        for (const a of anchors) {
+          const href = a.getAttribute('href') || ''
+          // Accept both "/p/<code>" and "/<username>/p/<code>" patterns
+          const m = href.match(/\/p\/([A-Za-z0-9_-]+)/)
+          if (!m) continue
+          const shortcode = m[1]
+          const url = `https://www.instagram.com/p/${shortcode}/`
+          if (!collected.includes(url)) {
+            collected.push(url)
+            if (collected.length >= maxPosts) break
+          }
+        }
+        return collected
+      }, limit)
+
+      for (const u of batch) {
+        urls.add(u)
+        if (urls.size >= limit) break
+      }
+    }
+
+    return Array.from(urls).slice(0, limit)
   } catch (error) {
     throw new Error(`Failed to get post URLs: ${error.message}`)
   }
