@@ -284,52 +284,180 @@ export async function postToInstagram(page, imageUrl, caption, options = {}) {
       await screenshotStep(page, '06-caption')
     }
 
+    // 6) Close any modals that might block Share button (e.g., "Tag: Search")
+    try {
+      const modalClosed = await page.evaluate(() => {
+        // First, look for "Tag: Search" or similar modals specifically
+        const tagInputs = Array.from(document.querySelectorAll('input'))
+        for (const input of tagInputs) {
+          const placeholder = input.getAttribute('placeholder')?.toLowerCase() || ''
+          const label = input.getAttribute('aria-label')?.toLowerCase() || ''
+          // Check if this is a tag/search input
+          if (placeholder.includes('tag') || placeholder.includes('search') || 
+              label.includes('tag') || label.includes('search')) {
+            const modal = input.closest('div[role="dialog"], div[role="alert"], div[class*="modal"], div[class*="dialog"]')
+            if (modal) {
+              // Look for close button (X) in the modal
+              const closeBtn = modal.querySelector('button[aria-label*="Close" i], button[aria-label*="Dismiss" i]') ||
+                              Array.from(modal.querySelectorAll('button, [role="button"]')).find(btn => {
+                                const text = btn.textContent?.trim() || ''
+                                const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || ''
+                                return text === '×' || text === 'X' || text === '✕' || 
+                                       ariaLabel.includes('close') || ariaLabel.includes('dismiss')
+                              })
+              if (closeBtn) {
+                closeBtn.click()
+                return true
+              }
+            }
+          }
+        }
+        
+        // Also check for any overlay modals that might be blocking
+        const dialogs = document.querySelectorAll('div[role="dialog"], div[role="alert"]')
+        for (const dialog of dialogs) {
+          // Skip the main create post dialog
+          const hasCreateElements = dialog.querySelector('textarea[aria-label*="caption" i], button[aria-label*="Share" i]')
+          if (!hasCreateElements) {
+            // This is a different modal, try to close it
+            const closeBtn = dialog.querySelector('button[aria-label*="Close" i], button[aria-label*="Dismiss" i]') ||
+                            Array.from(dialog.querySelectorAll('button, [role="button"]')).find(btn => {
+                              const text = btn.textContent?.trim() || ''
+                              const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || ''
+                              return text === '×' || text === 'X' || text === '✕' || 
+                                     ariaLabel.includes('close') || ariaLabel.includes('dismiss')
+                            })
+            if (closeBtn) {
+              closeBtn.click()
+              return true
+            }
+          }
+        }
+        
+        return false
+      })
+      
+      if (modalClosed) {
+        log('info', 'Closed blocking modal before Share')
+        await sleep(randomDelay(500, 1000))
+      } else {
+        // Try pressing ESC to close any open modals (but not the main create dialog)
+        await page.keyboard.press('Escape')
+        await sleep(randomDelay(300, 600))
+      }
+    } catch (err) {
+      log('warn', 'Could not close modals before Share', { error: err.message })
+    }
+
     // 6) Share
     log('info', 'Clicking Share')
     const shareBtn = await waitForElementBySelectorsOrText(page, selectors.shareButton, ['Share'], 20000)
     await clickWithRandomOffset(page, shareBtn)
     
-    // Wait longer for post to actually process
-    await sleep(randomDelay(5000, 8000))
+    // Wait for post to process - check for dialog closing, button disappearing, or success indicators
+    log('info', 'Waiting for post to process after Share click')
+    let successConfirmed = false
+    let dialogClosed = false
+    
+    // Wait up to 20 seconds for processing indicators
+    for (let i = 0; i < 20; i++) {
+      await sleep(1000)
+      
+      // Check if dialog closed (strong indicator of success)
+      const createDialogStillOpen = await page.evaluate(() => {
+        // Check for create dialog elements - caption textarea or Share button in a dialog
+        const dialogs = document.querySelectorAll('div[role="dialog"]')
+        for (const dialog of dialogs) {
+          const hasCaption = dialog.querySelector('textarea[aria-label*="caption" i], textarea[placeholder*="caption" i]')
+          const shareBtn = dialog.querySelector('button[aria-label*="Share" i]')
+          const hasShareBtn = shareBtn || Array.from(dialog.querySelectorAll('button')).some(btn => 
+            btn.textContent?.toLowerCase().includes('share')
+          )
+          // Also check for Next button which is part of create flow
+          const hasNextBtn = dialog.querySelector('button._acan._acap._acas')
+          if (hasCaption || hasShareBtn || hasNextBtn) {
+            return true // Create dialog still open
+          }
+        }
+        // Also check if caption textarea exists anywhere (might be outside dialog in some UI)
+        const captionExists = document.querySelector('textarea[aria-label*="caption" i], textarea[placeholder*="caption" i]')
+        if (captionExists) {
+          // Check if it's visible and in a create context
+          const rect = captionExists.getBoundingClientRect()
+          if (rect.width > 0 && rect.height > 0) {
+            return true
+          }
+        }
+        return false // Create dialog appears to be closed
+      })
+      
+      if (!createDialogStillOpen) {
+        dialogClosed = true
+        log('info', 'Create dialog closed - post likely succeeded')
+        successConfirmed = true
+        break
+      }
+      
+      // Check for success toast or messages
+      try {
+        const hasSuccessMessage = await page.evaluate(() => {
+          const bodyText = document.body.innerText.toLowerCase()
+          const successTexts = ['your post has been shared', 'post shared', 'shared', 'posted']
+          return successTexts.some(text => bodyText.includes(text))
+        })
+        if (hasSuccessMessage) {
+          log('info', 'Success message detected')
+          successConfirmed = true
+          break
+        }
+      } catch {}
+      
+      // Check if Share button disappeared (indicates processing completed)
+      const shareBtnStillExists = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'))
+        return buttons.some(btn => {
+          const text = btn.textContent?.toLowerCase() || ''
+          const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || ''
+          return text.includes('share') || ariaLabel.includes('share')
+        })
+      })
+      
+      if (!shareBtnStillExists && i > 3) {
+        // Share button disappeared after a few seconds - likely succeeded
+        log('info', 'Share button disappeared - post likely succeeded')
+        successConfirmed = true
+        break
+      }
+    }
+    
+    // Additional wait for Instagram to fully process
+    await sleep(randomDelay(3000, 5000))
 
-    // Check for error messages first
+    // Check for error messages
     let hasError = false
     try {
       const errorIndicators = await page.evaluate(() => {
-        const errorTexts = ['error', 'failed', 'try again', 'something went wrong', 'couldn\'t share']
+        const errorTexts = ['error', 'failed', 'try again', 'something went wrong', 'couldn\'t share', 'unable to share']
         const allText = document.body.innerText.toLowerCase()
         return errorTexts.some(text => allText.includes(text))
       })
       if (errorIndicators) {
         log('warn', 'Error indicators found after sharing')
         hasError = true
+        successConfirmed = false // Override if we see errors
       }
     } catch {}
-
-    // Wait for success indicator or dialog to close
-    let successConfirmed = false
-    let postUrl = null
     
-    try {
-      // Wait for success toast or navigation away from create page
-      await Promise.race([
-        (async () => {
-          try {
-            await waitForAnySelector(page, selectors.successToast, 15000)
-            successConfirmed = true
-          } catch {}
-        })(),
-        (async () => {
-          // Check if we navigated away from create page (indicates success)
-          await sleep(8000)
-          const currentUrl = page.url()
-          if (!currentUrl.includes('/create/')) {
-            successConfirmed = true
-          }
-        })(),
-        sleep(15000), // Max wait time
-      ])
-    } catch {}
+    // Check if we navigated away from create page (another success indicator)
+    if (!successConfirmed) {
+      const currentUrl = page.url()
+      if (!currentUrl.includes('/create/')) {
+        log('info', 'Navigated away from create page - post likely succeeded')
+        successConfirmed = true
+      }
+    }
+
+    let postUrl = null
 
     await screenshotStep(page, '07-shared')
 
@@ -350,18 +478,33 @@ export async function postToInstagram(page, imageUrl, caption, options = {}) {
       }
       
       // If we don't have a post URL yet, use the review helper function
+      // Wait a bit longer for Instagram to process and show the post in profile
       if (!postUrl && options.username) {
         log('info', 'Navigating to user profile to find new post', { username: options.username })
+        // Give Instagram more time to process the post before checking profile
+        await sleep(randomDelay(3000, 5000))
         try {
           // Import and use the review helper function
           const { getNewPostUrl } = await import('./review.js')
-          const profilePostUrl = await getNewPostUrl(page, options.username)
           
-          if (profilePostUrl) {
-            postUrl = profilePostUrl
-            log('info', 'Found post URL from profile', { postUrl })
-          } else {
-            log('warn', 'Could not find post URL from profile', { username: options.username })
+          // Try multiple times with delays - post might not appear immediately
+          for (let attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+              log('info', `Retrying to find post URL (attempt ${attempt + 1}/3)`)
+              await sleep(randomDelay(5000, 8000))
+            }
+            
+            const profilePostUrl = await getNewPostUrl(page, options.username)
+            
+            if (profilePostUrl) {
+              postUrl = profilePostUrl
+              log('info', 'Found post URL from profile', { postUrl, attempt: attempt + 1 })
+              break
+            }
+          }
+          
+          if (!postUrl) {
+            log('warn', 'Could not find post URL from profile after multiple attempts', { username: options.username })
           }
         } catch (profileErr) {
           log('warn', 'Failed to get post URL from profile', { error: profileErr.message })
@@ -507,18 +650,20 @@ export async function postToInstagram(page, imageUrl, caption, options = {}) {
     } catch {}
 
     // Determine success based on multiple factors
-    // Require: no errors AND (verified post OR (success confirmed AND postUrl found))
-    // This ensures we don't report success just because we found a random post URL
+    // If dialog closed and no errors, consider it successful even without URL verification
+    // Instagram sometimes takes time to show posts in profile, but the post was still created
     const actuallySucceeded = !hasError && (
       verified || // Post URL verified to exist
       (successConfirmed && postUrl) || // Success confirmed AND we have a post URL
-      (successConfirmed && !postUrl) // Success confirmed even without URL (might be timing)
+      (successConfirmed && !postUrl) || // Success confirmed even without URL (might be timing)
+      (dialogClosed && !hasError) // Dialog closed with no errors - post likely succeeded
     )
     
     if (!actuallySucceeded) {
       log('warn', 'Post may not have succeeded - no clear confirmation', {
         hasError,
         successConfirmed,
+        dialogClosed,
         verified,
         postUrl: postUrl || 'none'
       })

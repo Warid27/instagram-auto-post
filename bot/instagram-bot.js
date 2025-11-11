@@ -12,6 +12,7 @@ import 'winston-daily-rotate-file'
 import { postToInstagram as postToInstagramHelper } from './helpers/post.js'
 import { loginToInstagram } from './helpers/login.js'
 import { decryptPassword } from './utils/encryption.js'
+import { checkPostImage } from './checker-bot.js'
 
 // Load environment variables
 dotenv.config()
@@ -212,7 +213,7 @@ async function postToInstagram(page, post, account) {
 }
 
 // Process a single post with retries
-async function processPost(browser, post) {
+async function processPost(browser, post, cyclePostCount = { current: 0, max: CONFIG.maxPostsPerDay }) {
   const page = await browser.newPage()
   page.setDefaultNavigationTimeout(CONFIG.pageLoadTimeout)
 
@@ -224,6 +225,13 @@ async function processPost(browser, post) {
   let results = []
 
   for (const account of targetAccounts) {
+    // Check cycle post limit before processing
+    log('info', `Post limit check: ${cyclePostCount.current}/${cyclePostCount.max} posts in this cycle`)
+    if (cyclePostCount.current >= cyclePostCount.max) {
+      log('info', `Post limit reached (${cyclePostCount.current}/${cyclePostCount.max}). Stopping bot cycle.`)
+      await page.close()
+      return { limitReached: true, results }
+    }
     // Check daily limit for the account
     const { data: accountRow } = await supabase
       .from('accounts')
@@ -271,6 +279,81 @@ async function processPost(browser, post) {
             .eq('id', account.id)
 
           await logActivity('success', `Posted to @${account.instagram_username}`, { url: postedUrl || 'N/A', postId: post.id, accountId: account.id }, post.user_id)
+
+          // Run image similarity check after successful post (async, non-blocking)
+          try {
+            log('info', 'Starting image similarity check', { postId: post.id, accountId: account.id, postUrl: postedUrl })
+            
+            // Prepare post_account data for checker
+            const postAccountData = {
+              id: null, // We'll need to fetch the post_accounts id
+              post: {
+                id: post.id,
+                user_id: post.user_id,
+                image_url: post.image_url,
+                caption: post.caption,
+              },
+              account: {
+                id: account.id,
+                instagram_username: account.instagram_username,
+                password_encrypted: account.password_encrypted,
+                cookies: account.cookies,
+                is_active: account.is_active,
+              },
+              instagram_post_url: postedUrl,
+            }
+
+            // Fetch the post_accounts id
+            const { data: postAccountRow } = await supabase
+              .from('post_accounts')
+              .select('id')
+              .eq('post_id', post.id)
+              .eq('account_id', account.id)
+              .single()
+
+            if (postAccountRow) {
+              postAccountData.id = postAccountRow.id
+              
+              // Run checker asynchronously (don't await - let it run in background)
+              // Use existing page since we're already logged in
+              checkPostImage(postAccountData, page)
+                .then((checkResult) => {
+                  if (checkResult.success) {
+                    log('info', 'Image similarity check completed', {
+                      postId: post.id,
+                      accountId: account.id,
+                      similarity: checkResult.similarity?.toFixed(4),
+                      isSimilar: checkResult.isSimilar,
+                    })
+                  } else {
+                    log('warn', 'Image similarity check failed', {
+                      postId: post.id,
+                      accountId: account.id,
+                      error: checkResult.error,
+                    })
+                  }
+                })
+                .catch((checkError) => {
+                  log('error', 'Image similarity check error', {
+                    postId: post.id,
+                    accountId: account.id,
+                    error: checkError.message,
+                  })
+                })
+            } else {
+              log('warn', 'Could not find post_accounts record for similarity check', {
+                postId: post.id,
+                accountId: account.id,
+              })
+            }
+          } catch (checkErr) {
+            // Don't fail the post if checker fails
+            log('warn', 'Failed to start image similarity check', {
+              postId: post.id,
+              accountId: account.id,
+              error: checkErr.message,
+            })
+          }
         } else {
           throw new Error(res.error || 'Unknown failure while posting')
         }
@@ -310,10 +393,22 @@ async function processPost(browser, post) {
 
     results.push({ accountId: account.id, success, postedUrl, error: lastError?.message })
 
-    // Delay between accounts to avoid detection
-    const delayMs = randomDelay(CONFIG.minDelayMs, CONFIG.maxDelayMs)
-    log('info', `Waiting ${Math.round(delayMs / 1000)}s before next account`)    
-    await sleep(delayMs)
+    // Increment post count after each attempt (success or failed)
+    cyclePostCount.current += 1
+    log('info', `Post count updated: ${cyclePostCount.current}/${cyclePostCount.max} posts in this cycle`)
+
+    // Check if we've reached the limit
+    if (cyclePostCount.current >= cyclePostCount.max) {
+      log('info', `Post limit reached (${cyclePostCount.current}/${cyclePostCount.max}). Stopping bot cycle.`)
+      break // Stop processing more accounts
+    }
+
+    // Delay between accounts to avoid detection (only if not at limit)
+    if (cyclePostCount.current < cyclePostCount.max) {
+      const delayMs = randomDelay(CONFIG.minDelayMs, CONFIG.maxDelayMs)
+      log('info', `Waiting ${Math.round(delayMs / 1000)}s before next account`)    
+      await sleep(delayMs)
+    }
   }
 
   await page.close()
@@ -339,6 +434,8 @@ async function processPost(browser, post) {
       .update({ status: 'processing', updated_at: nowIso() })
       .eq('id', post.id)
   }
+
+  return { limitReached: cyclePostCount.current >= cyclePostCount.max, results }
 }
 
 // Main bot run function
@@ -378,10 +475,22 @@ export async function runBot() {
       ],
     })
 
+    // Track posts in this cycle (shared across all posts)
+    const cyclePostCount = {
+      current: 0,
+      max: CONFIG.maxPostsPerDay
+    }
+
     // Process posts sequentially
     for (const post of queue) {
       try {
         log('info', `Processing post ${post.id}`)
+
+        // Check cycle limit before processing post
+        if (cyclePostCount.current >= cyclePostCount.max) {
+          log('info', `Post limit reached (${cyclePostCount.current}/${cyclePostCount.max}). Stopping bot cycle.`)
+          break
+        }
 
         // Mark as processing
         await supabase
@@ -389,13 +498,26 @@ export async function runBot() {
           .update({ status: 'processing', updated_at: nowIso() })
           .eq('id', post.id)
 
-        await processPost(browser, post)
+        const result = await processPost(browser, post, cyclePostCount)
+        
+        // If limit reached, stop processing more posts
+        if (result && result.limitReached) {
+          log('info', `Post limit reached during post processing. Stopping bot cycle.`)
+          break
+        }
       } catch (err) {
         log('error', `Post ${post.id} failed`, { error: err.message })
         await supabase
           .from('posts')
           .update({ status: 'failed', updated_at: nowIso() })
           .eq('id', post.id)
+        
+        // Increment count even on error
+        cyclePostCount.current += 1
+        if (cyclePostCount.current >= cyclePostCount.max) {
+          log('info', `Post limit reached after error (${cyclePostCount.current}/${cyclePostCount.max}). Stopping bot cycle.`)
+          break
+        }
       }
     }
 
